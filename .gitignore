@@ -1,0 +1,10 @@
+/bin/
+*.log
+.DS_Store
+.env
+.env.local
+node_modules/
+dist/
+.next/
+coverage/
+*.test
