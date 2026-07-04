@@ -8,3 +8,4 @@ dist/
 .next/
 coverage/
 *.test
+dump.rdb

@@ -83,6 +83,22 @@ func (r *Router) Len() int {
 	return len(r.servers)
 }
 
+// ReplaceAll atomically swaps the entire routing table for servers. Store's
+// periodic refresh (store.go) uses this rather than diffing old vs. new: a
+// full swap is simpler to reason about and just as cheap at Conduit's
+// expected server-count scale (thousands, not millions), and it guarantees
+// a server removed from the database disappears from routing on the very
+// next refresh instead of requiring an explicit Remove call.
+func (r *Router) ReplaceAll(servers []*Server) {
+	next := make(map[string]*Server, len(servers))
+	for _, s := range servers {
+		next[routeKey(s.TenantSlug, s.Name)] = s
+	}
+	r.mu.Lock()
+	r.servers = next
+	r.mu.Unlock()
+}
+
 func routeKey(tenantSlug, serverName string) string {
 	return tenantSlug + "/" + serverName
 }

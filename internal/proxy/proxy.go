@@ -79,31 +79,67 @@ type Proxy struct {
 	checkers  []ReadyChecker
 	log       zerolog.Logger
 
+	authMiddleware      Middleware
+	rateLimitMiddleware Middleware
+
 	mcpHandler http.Handler
 }
 
-// New creates a Proxy with all dependencies injected. extraCheckers lets
-// later phases add PostgreSQL/Redis readiness checks without Proxy needing
-// to know about those packages directly.
+// Option customizes a Proxy at construction time. See WithAuthMiddleware,
+// WithRateLimitMiddleware, and WithReadyChecker.
+type Option func(*Proxy)
+
+// WithAuthMiddleware replaces the default no-op auth step with a real one —
+// main.go passes internal/auth.NewMiddleware(...) here starting in Phase 2.
+// Kept as an injected Option rather than a constructor parameter so
+// internal/proxy never has to import internal/auth (which itself imports
+// internal/store): the dependency points from main.go inward, not between
+// internal packages.
+func WithAuthMiddleware(mw Middleware) Option {
+	return func(p *Proxy) { p.authMiddleware = mw }
+}
+
+// WithRateLimitMiddleware replaces the default no-op rate-limit step with a
+// real one — main.go passes internal/ratelimit.NewMiddleware(...) here
+// starting in Phase 2. See WithAuthMiddleware for why this is an Option.
+func WithRateLimitMiddleware(mw Middleware) Option {
+	return func(p *Proxy) { p.rateLimitMiddleware = mw }
+}
+
+// WithReadyChecker adds an extra dependency /readyz must verify (e.g.
+// PostgreSQL, Redis) alongside the always-present routing-table check.
+func WithReadyChecker(c ReadyChecker) Option {
+	return func(p *Proxy) { p.checkers = append(p.checkers, c) }
+}
+
+// New creates a Proxy with all required dependencies injected and any
+// number of Options applied on top. With no options, auth and rate limiting
+// are no-op pass-throughs (Phase 1 behavior); see WithAuthMiddleware and
+// WithRateLimitMiddleware for how later phases enable the real thing.
 func New(
 	cfg *config.Config,
 	router *tenant.Router,
 	plugins *plugin.Registry,
 	auditor *audit.Writer,
 	log zerolog.Logger,
-	extraCheckers ...ReadyChecker,
+	opts ...Option,
 ) *Proxy {
 	p := &Proxy{
-		cfg:       cfg,
-		router:    router,
-		plugins:   plugins,
-		auditor:   auditor,
-		transport: newTransport(),
-		sse:       &SSEProxy{plugins: plugins},
-		checkers:  append([]ReadyChecker{routingChecker{router: router}}, extraCheckers...),
-		log:       log,
+		cfg:                 cfg,
+		router:              router,
+		plugins:             plugins,
+		auditor:             auditor,
+		transport:           newTransport(),
+		sse:                 &SSEProxy{plugins: plugins},
+		checkers:            []ReadyChecker{routingChecker{router: router}},
+		log:                 log,
+		authMiddleware:      AuthMiddleware,
+		rateLimitMiddleware: RateLimitMiddleware,
 	}
-	p.mcpHandler = Chain(http.HandlerFunc(p.forward), StandardChain(plugins)...)
+	for _, opt := range opts {
+		opt(p)
+	}
+	p.mcpHandler = Chain(http.HandlerFunc(p.forward), standardChain(p.authMiddleware, p.rateLimitMiddleware, plugins)...)
 	return p
 }
 
@@ -164,11 +200,13 @@ func (p *Proxy) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// mcpPathSegments parses "/mcp/{tenant_slug}/{server_name}" and returns the
+// MCPPathSegments parses "/mcp/{tenant_slug}/{server_name}" and returns the
 // two segments. It requires exactly that shape (no trailing sub-path) since
 // an MCP tool call carries everything it needs in the JSON-RPC body, not
-// the URL — see spec/02-proxy.md §2.
-func mcpPathSegments(path string) (tenantSlug, serverName string, ok bool) {
+// the URL — see spec/02-proxy.md §2. Exported so ratelimit/auth middleware
+// (which run earlier in the chain than the proxy handler) can resolve the
+// same server_name for scoped rate limiting without re-deriving the rule.
+func MCPPathSegments(path string) (tenantSlug, serverName string, ok bool) {
 	parts := strings.SplitN(path, "/", 5)
 	if len(parts) != 4 || parts[1] != "mcp" || parts[2] == "" || parts[3] == "" {
 		return "", "", false
@@ -183,7 +221,7 @@ func mcpPathSegments(path string) (tenantSlug, serverName string, ok bool) {
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	tenantSlug, serverName, ok := mcpPathSegments(r.URL.Path)
+	tenantSlug, serverName, ok := MCPPathSegments(r.URL.Path)
 	if !ok {
 		writeError(w, r, http.StatusNotFound, "not found")
 		return
@@ -199,7 +237,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	// upstream request) so we can parse it once for the audit event and the
 	// tools/call detection SSEProxy needs — MCP request bodies are small
 	// JSON-RPC envelopes, never the large payloads that flow back over SSE.
-	body, err := readAndReplaceBody(r)
+	body, err := ReadAndReplaceBody(r)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "failed to read request body")
 		return

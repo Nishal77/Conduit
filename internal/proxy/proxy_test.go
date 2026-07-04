@@ -145,7 +145,7 @@ func TestMcpPathSegments(t *testing.T) {
 		{"/mcp//github", "", "", false},
 	}
 	for _, tt := range tests {
-		tenantSlug, serverName, ok := mcpPathSegments(tt.path)
+		tenantSlug, serverName, ok := MCPPathSegments(tt.path)
 		assert.Equal(t, tt.wantOK, ok, tt.path)
 		if tt.wantOK {
 			assert.Equal(t, tt.wantTenant, tenantSlug, tt.path)

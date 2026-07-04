@@ -24,7 +24,9 @@ fuzz: ## Run the MCP parser fuzz test for 60 seconds
 lint: ## Run golangci-lint
 	golangci-lint run ./...
 
-test-int: ## Integration tests (requires Docker; added in Phase 2)
+test-int: ## Integration tests against real PostgreSQL + Redis
+	## Uses testcontainers-go (requires Docker) unless TEST_DATABASE_URL /
+	## TEST_REDIS_URL point at already-running instances.
 	go test -tags=integration ./...
 
 test-e2e: ## Playwright E2E tests (added in Phase 4)
@@ -39,11 +41,11 @@ docker-build: ## Build the Conduit Docker image (added in Phase 3)
 docker-run: ## docker compose up -d (added in Phase 3)
 	@echo "no docker-compose.yml yet (Phase 3)"
 
-migrate-up: ## Run pending migrations (added in Phase 2)
-	@echo "no migrations yet (Phase 2)"
+migrate-up: ## Apply pending migrations to $DATABASE_URL
+	go run ./cmd/conduit migrate --db-url "$(DATABASE_URL)"
 
-migrate-down: ## Rollback the last migration (added in Phase 2)
-	@echo "no migrations yet (Phase 2)"
+migrate-down: ## Rollback the last migration (added in Phase 3's full CLI)
+	@echo "conduit migrate only applies Up() today; Down() lands with the rest of the CLI in Phase 3"
 
 generate: ## go generate (mocks, swaggo) — added in later phases
 	go generate ./...

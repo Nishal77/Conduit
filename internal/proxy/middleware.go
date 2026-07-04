@@ -28,17 +28,26 @@ const (
 	ctxKeyStartTime
 )
 
-// TenantIDFromContext returns the tenant identifier set by AuthMiddleware,
-// or "" if the request has not passed through it.
-//
-// Phase 1 note: with no auth/database layer yet, AuthMiddleware sets this to
-// the tenant_slug parsed from the URL. Phase 2 replaces that with the real
-// tenant UUID resolved from a validated API key or JWT (ADR-004: tenant_id
-// is never trusted from the URL in production) — callers should treat this
-// value as opaque and not assume it's a UUID until then.
+// TenantIDFromContext returns the authenticated tenant identifier set by
+// the auth middleware, or "" if the request has not passed through it (or
+// no auth middleware is configured — see WithAuthMiddleware).
 func TenantIDFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyTenantID).(string)
 	return v
+}
+
+// WithTenantID returns a copy of ctx carrying tenantID as the authenticated
+// tenant identity (ADR-004: tenant_id must come from a validated credential,
+// never the URL or request body). internal/auth's middleware calls this once
+// an API key or JWT validates successfully; nothing else in Conduit should.
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, ctxKeyTenantID, tenantID)
+}
+
+// WithAuthMethod returns a copy of ctx recording how the request was
+// authenticated ("api_key", "jwt", or "none"). See AuthMethodFromContext.
+func WithAuthMethod(ctx context.Context, method string) context.Context {
+	return context.WithValue(ctx, ctxKeyAuthMethod, method)
 }
 
 // ServerNameFromContext returns the MCP server name segment of the request
@@ -88,18 +97,19 @@ func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
 	return h
 }
 
-// StandardChain returns the middleware chain applied to every proxy
-// request, in the exact order specified by spec/02-proxy.md §4. Auth, rate
-// limiting, and policy are no-op pass-throughs in Phase 1 — they gain real
-// behavior in Phase 2 (auth/ratelimit) and Phase 6 (policy) respectively,
-// but stay wired into this same slot so the chain's shape never changes.
-func StandardChain(plugins *plugin.Registry) []Middleware {
+// standardChain returns the middleware chain applied to every proxy
+// request, in the exact order specified by spec/02-proxy.md §4. auth and
+// rateLimit are injected (see WithAuthMiddleware / WithRateLimitMiddleware
+// in proxy.go) so this package doesn't need to import internal/auth or
+// internal/ratelimit directly; New defaults both to a no-op pass-through
+// when the caller doesn't supply one. Policy stays a no-op until Phase 6.
+func standardChain(auth, rateLimit Middleware, plugins *plugin.Registry) []Middleware {
 	return []Middleware{
 		RequestIDMiddleware,
 		LoggingMiddleware,
 		RecoveryMiddleware,
-		AuthMiddleware,
-		RateLimitMiddleware,
+		auth,
+		rateLimit,
 		PolicyMiddleware,
 		PluginBeforeMiddleware(plugins),
 	}
@@ -197,27 +207,25 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// AuthMiddleware validates the caller's credentials and sets tenant_id in
-// context.
-//
-// Phase 1: no auth backend exists yet, so this is a deliberate no-op that
-// trusts the tenant_slug URL segment (already extracted into context by the
-// proxy handler before the chain runs — see Proxy.ServeHTTP) and marks the
-// auth method as "none". Phase 2 replaces the body of this function with
-// real API key / JWT validation and rejects unauthenticated requests with
-// 401; every call site and context key stays the same.
+// AuthMiddleware is the default auth step: a no-op that marks every request
+// unauthenticated ("none") and leaves tenant_id unset. Proxy.New wires this
+// in unless the caller supplies a real one via WithAuthMiddleware — which
+// main.go does starting in Phase 2, using internal/auth.NewMiddleware to
+// validate API keys/JWTs and reject unauthenticated requests with 401. A
+// deployment that never configures auth (e.g. a quick local test) still
+// gets a working proxy, just with no tenant isolation — the same tradeoff
+// spec/02-proxy.md's Phase 1 design accepted.
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := context.WithValue(r.Context(), ctxKeyAuthMethod, "none")
+		ctx := WithAuthMethod(r.Context(), "none")
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// RateLimitMiddleware enforces the token-bucket rate limit for the caller.
-//
-// Phase 1: no Redis-backed limiter exists yet, so this is a no-op
-// pass-through. Phase 2 replaces the body with a Redis Lua token-bucket
-// check that returns 429 with a Retry-After header when exceeded.
+// RateLimitMiddleware is the default rate-limit step: a no-op pass-through.
+// Proxy.New wires this in unless the caller supplies a real one via
+// WithRateLimitMiddleware — which main.go does starting in Phase 2, using
+// internal/ratelimit.NewMiddleware for the Redis token-bucket check.
 func RateLimitMiddleware(next http.Handler) http.Handler {
 	return next
 }
@@ -249,7 +257,7 @@ func PluginBeforeMiddleware(plugins *plugin.Registry) Middleware {
 				return
 			}
 
-			body, err := readAndReplaceBody(r)
+			body, err := ReadAndReplaceBody(r)
 			if err != nil {
 				writeError(w, r, http.StatusBadRequest, "failed to read request body")
 				return
@@ -277,7 +285,7 @@ func PluginBeforeMiddleware(plugins *plugin.Registry) Middleware {
 				writeError(w, r, http.StatusInternalServerError, "failed to re-encode request")
 				return
 			}
-			replaceBody(r, out)
+			ReplaceBody(r, out)
 			next.ServeHTTP(w, r)
 		})
 	}

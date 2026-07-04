@@ -6,10 +6,11 @@ Kong / Traefik for AI agent tool calls — Conduit sits between AI agents and
 your upstream MCP servers, enforcing authentication, rate limiting, policy,
 and audit logging on every tool call, with sub-millisecond overhead.
 
-> Status: pre-alpha. Phase 1 (core reverse proxy) is implemented; Phases 2–9
-> (auth, database, audit log, dashboard, OAuth, plugins, Kubernetes,
-> enterprise features) are in progress. See [CLAUDE.md](claude.md) for the
-> full build plan and phase status.
+> Status: pre-alpha. Phases 1–2 are implemented: core reverse proxy, SSE
+> streaming, PostgreSQL-backed routing, API key authentication, and Redis
+> rate limiting. Phases 3–9 (audit persistence, dashboard, OAuth, plugins,
+> Kubernetes, enterprise features) are in progress. See
+> [CLAUDE.md](claude.md) for the full build plan and phase status.
 
 ## Why
 

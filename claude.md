@@ -447,7 +447,7 @@ Update this table as phases complete:
 | Phase | Name | Weeks | Status |
 |---|---|---|---|
 | P1 | Repository & Core Proxy | 1–4 | ✅ Complete |
-| P2 | Auth, Rate Limiting & Database | 5–8 | ⬜ Not started |
+| P2 | Auth, Rate Limiting & Database | 5–8 | ✅ Complete |
 | P3 | Audit Log, CLI & Docker (MVP 🚀) | 9–12 | ⬜ Not started |
 | P4 | Management API & TypeScript Dashboard | 13–16 | ⬜ Not started |
 | P5 | OAuth 2.0 & Multi-Tenant Routing | 17–20 | ⬜ Not started |
@@ -1074,9 +1074,36 @@ docs(cli): add --json flag documentation for all commands
   OSS boilerplate (README, LICENSE, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT,
   .golangci.yaml, CI workflow) in place.
 
+- **Phase 2 complete**: `migrations/000001_initial_schema` (tenants, api_keys,
+  mcp_servers, rate_limit_configs) embedded into the binary via `migrations/embed.go`
+  and applied through `conduit migrate --db-url`. `internal/store` (db.go, tenants.go,
+  apikeys.go, servers.go, ratelimits.go) — hand-written pgx/v5 queries, sentinel errors
+  (ErrNotFound/ErrConflict), no ORM. `internal/auth` (API key generation/hashing,
+  Redis-cached validator with PostgreSQL fallback, constant-time hash comparison, JWT
+  validator stubbed until Phase 5). `internal/ratelimit` (Redis Lua token bucket,
+  4-scope priority check: tool > server > agent > tenant, 30s in-process config cache,
+  fail-open/fail-closed both covered). `internal/tenant/store.go` (5s-refresh
+  DB-backed routing table). `internal/proxy` gained a functional-options pattern
+  (`WithAuthMiddleware`, `WithRateLimitMiddleware`, `WithReadyChecker`) so Phase 1's
+  no-op middleware slots can be swapped for the real ones without changing the
+  middleware chain's shape. `cmd/conduit` gained `migrate` and wires the full stack
+  when PostgreSQL/Redis are reachable, falling back to Phase 1's demo-flag mode
+  otherwise. Verified end-to-end against real local PostgreSQL 15 and Redis (no
+  Docker available in this session — used native `pg_ctl`/`redis-server` instead):
+  missing/invalid API key → 401, valid key → 200 proxied, exceeding a 3-req/min
+  limit → 429 with `Retry-After`, `/readyz` reports postgres/redis/routing all "ok".
+  Integration test suite (testcontainers-go, `internal/store` + `internal/auth`,
+  build-tagged `integration`) also run and passed against the same local instances via
+  `TEST_DATABASE_URL`/`TEST_REDIS_URL` — caught and fixed a real NOT NULL constraint
+  bug in `MCPServerStore.Create` along the way. Unit tests for `internal/ratelimit`
+  use miniredis (real Lua script execution, no network). `go test -race ./...` clean,
+  `gofmt`/`go vet` clean.
+
 **Next action:**
-- Start Phase 2: PostgreSQL schema + migrations, API key auth, Redis rate limiting
-- Read `spec/04-database.md`, `spec/05-auth.md`, `spec/06-ratelimit.md` first
+- Start Phase 3: audit log persistence (PostgreSQL-backed Sink replacing LogSink),
+  full CLI (`conduit audit tail/query/export`, `apikey create/list/revoke`),
+  Prometheus metrics, Docker packaging (MVP milestone)
+- Read `spec/07-audit.md`, `spec/08-cli.md`, `spec/09-observability.md` first
 
 ---
 
