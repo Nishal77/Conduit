@@ -17,7 +17,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// tracer returns Conduit's shared tracer, identical to internal/proxy's
+// (otel.Tracer is keyed by name, not by which package calls it).
+func tracer() trace.Tracer { return otel.Tracer("conduit") }
 
 //go:embed lua/token_bucket.lua
 var tokenBucketLua string
@@ -38,6 +44,7 @@ type Result struct {
 	ResetAt   time.Time // approximate time the bucket refills to capacity
 	Limit     int       // configured requests per window
 	Window    int       // configured window in seconds
+	Scope     string    // which scope produced this result: "tool" | "server" | "agent" | "tenant"
 }
 
 // scopeQuery is one (scope, target) pair Check evaluates, in priority order
@@ -98,6 +105,9 @@ func New(redisClient *redis.Client, rlStore *store.RateLimitStore, cfg *config.R
 // spec/06-ratelimit.md doesn't want an unreachable Redis to silently
 // disable rate limiting in a strict deployment).
 func (l *Limiter) Check(ctx context.Context, tenantID, serverName, toolName, agentID string) (*Result, error) {
+	ctx, span := tracer().Start(ctx, "conduit.ratelimit")
+	defer span.End()
+
 	queries := make([]scopeQuery, 0, 4)
 	if toolName != "" {
 		queries = append(queries, scopeQuery{"tool", toolName})
@@ -139,6 +149,9 @@ func (l *Limiter) Check(ctx context.Context, tenantID, serverName, toolName, age
 // checkBucket runs the token bucket Lua script for a single (scope, target)
 // key and translates its {allowed, remaining} reply into a Result.
 func (l *Limiter) checkBucket(ctx context.Context, tenantID, scope, target string, requests, windowSec int) (*Result, error) {
+	ctx, span := tracer().Start(ctx, "conduit.ratelimit.lua")
+	defer span.End()
+
 	key := fmt.Sprintf("rl:%s:%s:%s", tenantID, scope, target)
 	capacity := float64(requests) * l.cfg.BurstMultiplier
 	refillRate := float64(requests) / float64(windowSec)
@@ -168,6 +181,7 @@ func (l *Limiter) checkBucket(ctx context.Context, tenantID, scope, target strin
 		ResetAt:   time.Now().Add(time.Duration(windowSec) * time.Second),
 		Limit:     requests,
 		Window:    windowSec,
+		Scope:     scope,
 	}, nil
 }
 

@@ -215,7 +215,30 @@ func newViper() (*viper.Viper, error) {
 
 // Load reads configuration from the YAML file at path (if path is "", only
 // defaults and environment variables apply) and returns a validated Config.
+// Use this for anything that starts the proxy itself; for CLI tooling that
+// only needs a handful of fields (e.g. database.url) and shouldn't be
+// blocked by an unrelated field like auth.jwt_secret being unset, use
+// LoadPartial instead.
 func Load(path string) (*Config, error) {
+	cfg, err := LoadPartial(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate config: %w", err)
+	}
+	return cfg, nil
+}
+
+// LoadPartial reads configuration exactly like Load, but skips Validate.
+//
+// `conduit apikey` and `conduit audit` only ever touch Database (and
+// Observability, for --log-level), so requiring auth.jwt_secret or
+// distinct server ports to be configured just to run a one-shot admin
+// command would be a needless operational hurdle — those commands may
+// well run from an operator's laptop that has DATABASE_URL but not the
+// proxy's JWT signing secret.
+func LoadPartial(path string) (*Config, error) {
 	v, err := newViper()
 	if err != nil {
 		return nil, err
@@ -231,10 +254,6 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
-	}
-
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
 	return &cfg, nil

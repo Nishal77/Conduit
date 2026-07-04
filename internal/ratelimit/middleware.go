@@ -44,9 +44,11 @@ func NewMiddleware(limiter *Limiter) func(http.Handler) http.Handler {
 
 			setRateLimitHeaders(w, result)
 			if !result.Allowed {
+				proxy.RateLimitDecisionsTotal.WithLabelValues(tenantID, result.Scope, "deny").Inc()
 				writeRateLimited(w, r, result)
 				return
 			}
+			proxy.RateLimitDecisionsTotal.WithLabelValues(tenantID, result.Scope, "allow").Inc()
 			next.ServeHTTP(w, r)
 		})
 	}

@@ -50,6 +50,9 @@ func (s *SSEProxy) Forward(
 		return errors.New("response writer does not support flushing")
 	}
 
+	ActiveConnections.WithLabelValues(tenantID).Inc()
+	defer ActiveConnections.WithLabelValues(tenantID).Dec()
+
 	copyHeaders(w.Header(), upstreamResp.Header)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")

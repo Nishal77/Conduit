@@ -4,7 +4,9 @@
 BINARY      := bin/conduit
 MODULE      := github.com/conduit-oss/conduit
 VERSION     := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS     := -X main.version=$(VERSION)
+COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+BUILT       := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS     := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.built=$(BUILT)
 
 build: ## Build the conduit binary to ./bin/conduit
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/conduit
@@ -32,20 +34,20 @@ test-int: ## Integration tests against real PostgreSQL + Redis
 test-e2e: ## Playwright E2E tests (added in Phase 4)
 	@echo "no e2e suite yet (Phase 4)"
 
-test-load: ## k6 load test against a running stack (added in Phase 3)
-	@echo "no k6 suite yet (Phase 3)"
+test-load: ## k6 load test against a running stack — set BASE_URL/API_KEY/TENANT/SERVER
+	k6 run k6/load-test.js
 
-docker-build: ## Build the Conduit Docker image (added in Phase 3)
-	@echo "no Dockerfile yet (Phase 3)"
+docker-build: ## Build the Conduit Docker image
+	docker build -f docker/Dockerfile --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILT=$(BUILT) -t conduit:$(VERSION) .
 
-docker-run: ## docker compose up -d (added in Phase 3)
-	@echo "no docker-compose.yml yet (Phase 3)"
+docker-run: ## docker compose up -d (postgres, redis, migrate, conduit)
+	docker compose -f docker/docker-compose.yml up -d
 
 migrate-up: ## Apply pending migrations to $DATABASE_URL
 	go run ./cmd/conduit migrate --db-url "$(DATABASE_URL)"
 
-migrate-down: ## Rollback the last migration (added in Phase 3's full CLI)
-	@echo "conduit migrate only applies Up() today; Down() lands with the rest of the CLI in Phase 3"
+migrate-down: ## Rollback the last migration
+	go run ./cmd/conduit migrate --down --db-url "$(DATABASE_URL)"
 
 generate: ## go generate (mocks, swaggo) — added in later phases
 	go generate ./...

@@ -6,10 +6,12 @@ Kong / Traefik for AI agent tool calls — Conduit sits between AI agents and
 your upstream MCP servers, enforcing authentication, rate limiting, policy,
 and audit logging on every tool call, with sub-millisecond overhead.
 
-> Status: pre-alpha. Phases 1–2 are implemented: core reverse proxy, SSE
-> streaming, PostgreSQL-backed routing, API key authentication, and Redis
-> rate limiting. Phases 3–9 (audit persistence, dashboard, OAuth, plugins,
-> Kubernetes, enterprise features) are in progress. See
+> Status: pre-alpha, MVP milestone reached. Phases 1–3 are implemented: core
+> reverse proxy, SSE streaming, PostgreSQL-backed routing, API key
+> authentication, Redis rate limiting, persisted audit log, the full CLI
+> (`apikey`, `audit`, `migrate`, `version`), Prometheus metrics, OpenTelemetry
+> tracing, and Docker packaging. Phases 4–9 (management API, dashboard,
+> OAuth, plugins, Kubernetes, enterprise features) are in progress. See
 > [CLAUDE.md](claude.md) for the full build plan and phase status.
 
 ## Why
@@ -41,19 +43,38 @@ AI Agent (Claude / GPT / LangChain)
 
 ## Quickstart
 
+### Docker Compose (full stack: proxy + PostgreSQL + Redis)
+
+```bash
+export JWT_SECRET=$(openssl rand -hex 32)
+docker compose -f docker/docker-compose.yml up -d
+```
+
+This builds the image, runs migrations, and starts Conduit on `:8080`
+(proxy), `:8081` (management API, Phase 4), and `:9090` (Prometheus
+metrics). Register a tenant and an upstream server, then issue an API key:
+
+```bash
+docker compose -f docker/docker-compose.yml exec postgres \
+  psql -U conduit -c "INSERT INTO tenants (slug, name) VALUES ('acme', 'Acme Inc');"
+docker compose -f docker/docker-compose.yml exec postgres \
+  psql -U conduit -c "INSERT INTO mcp_servers (tenant_id, name, upstream_url)
+    SELECT id, 'github', 'http://your-upstream:3001' FROM tenants WHERE slug='acme';"
+
+./bin/conduit apikey create --name demo --tenant acme --config conduit.yaml
+
+curl -X POST http://localhost:8080/mcp/acme/github \
+  -H "Authorization: Bearer <key from above>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+### Local build (no database — quick pass-through test only)
+
 Requires Go 1.23+.
 
 ```bash
-git clone https://github.com/conduit-oss/conduit
-cd conduit
 export JWT_SECRET=$(openssl rand -hex 32)
 make run
-```
-
-This starts the proxy on `:8080` using [conduit.yaml](conduit.yaml). Register
-a development route and send a tool call through it:
-
-```bash
 ./bin/conduit proxy start \
   --demo-tenant acme --demo-server github --demo-upstream http://localhost:3001
 
@@ -61,20 +82,34 @@ curl -X POST http://localhost:8080/mcp/acme/github \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-`/mcp/{tenant_slug}/{server_name}` is the transparent proxy endpoint;
-`/healthz` and `/readyz` are liveness/readiness probes.
+Without PostgreSQL/Redis reachable, Conduit falls back to this
+no-auth/no-rate-limit compatibility mode — `/readyz` will report `postgres`
+and `redis` as unavailable, which is expected here.
 
-Full multi-tenant routing (backed by PostgreSQL), authentication, and rate
-limiting land in Phase 2 — see the build roadmap in [CLAUDE.md](claude.md)
-§9.
+`/mcp/{tenant_slug}/{server_name}` is the transparent proxy endpoint;
+`/healthz` and `/readyz` are liveness/readiness probes; `/metrics` (on the
+metrics port) is Prometheus-scrapable.
+
+### CLI
+
+```bash
+./bin/conduit migrate --db-url "$DATABASE_URL"       # apply schema
+./bin/conduit apikey create --name ci --tenant acme  # prints the raw key once
+./bin/conduit apikey list --tenant acme --json
+./bin/conduit audit tail --tenant acme                # live-tails new tool calls
+./bin/conduit audit query --tenant acme --from 24h --output csv
+./bin/conduit version --json
+```
 
 ## Development
 
 ```bash
-make build   # build ./bin/conduit
-make test    # unit tests
-make lint    # golangci-lint
-make fuzz    # 60s fuzz run of the MCP parser
+make build      # build ./bin/conduit
+make test       # unit tests
+make test-race  # unit tests with the race detector
+make test-int   # integration tests against real PostgreSQL + Redis (Docker or TEST_DATABASE_URL/TEST_REDIS_URL)
+make lint       # golangci-lint
+make fuzz       # 60s fuzz run of the MCP parser
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow and

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/conduit-oss/conduit/internal/mcp"
 	"github.com/rs/zerolog/log"
@@ -78,7 +79,9 @@ func (r *Registry) ForTenant(tenantID string) []Registration {
 func (r *Registry) RunBefore(ctx context.Context, tenantID string, req *mcp.Message) (*mcp.Message, error) {
 	current := req
 	for _, reg := range r.ForTenant(tenantID) {
+		start := time.Now()
 		modified, err := reg.Plugin.Before(ctx, current)
+		PluginLatencySeconds.WithLabelValues(reg.Plugin.Name(), "before").Observe(time.Since(start).Seconds())
 		if err != nil {
 			if errors.Is(err, ErrRequestBlocked) {
 				return nil, err
@@ -98,7 +101,9 @@ func (r *Registry) RunBefore(ctx context.Context, tenantID string, req *mcp.Mess
 func (r *Registry) RunAfter(ctx context.Context, tenantID string, req, resp *mcp.Message) *mcp.Message {
 	current := resp
 	for _, reg := range r.ForTenant(tenantID) {
+		start := time.Now()
 		modified, err := reg.Plugin.After(ctx, req, current)
+		PluginLatencySeconds.WithLabelValues(reg.Plugin.Name(), "after").Observe(time.Since(start).Seconds())
 		if err != nil {
 			log.Warn().Err(err).Str("plugin", reg.Plugin.Name()).Msg("plugin After hook failed, continuing with unmodified response")
 			continue

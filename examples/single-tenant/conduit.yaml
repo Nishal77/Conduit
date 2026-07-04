@@ -1,0 +1,73 @@
+# examples/single-tenant/conduit.yaml — one tenant, one upstream MCP server.
+#
+# Quickstart:
+#   export JWT_SECRET=$(openssl rand -hex 32)
+#   docker compose -f docker/docker-compose.yml up -d postgres redis migrate
+#   ./bin/conduit apikey create --name demo --tenant acme --config examples/single-tenant/conduit.yaml
+#   ./bin/conduit proxy start --config examples/single-tenant/conduit.yaml
+#
+# This assumes a tenant "acme" and an mcp_servers row for it already exist —
+# see the INSERT statements below, run once against the same database.
+#
+#   INSERT INTO tenants (slug, name, plan) VALUES ('acme', 'Acme Inc', 'pro');
+#   INSERT INTO mcp_servers (tenant_id, name, upstream_url)
+#     SELECT id, 'github', 'http://localhost:3001' FROM tenants WHERE slug = 'acme';
+
+server:
+  port: 8080
+  management_port: 8081
+  metrics_port: 9090
+  timeouts:
+    read: 30s
+    write: 60s
+    idle: 120s
+    upstream: 30s
+
+database:
+  url: "postgres://conduit:conduit@localhost:5432/conduit?sslmode=disable"
+  max_open_conns: 10
+  max_idle_conns: 2
+  conn_max_lifetime: 5m
+
+redis:
+  url: "redis://localhost:6379/0"
+  pool_size: 10
+
+auth:
+  jwt_secret: "${JWT_SECRET}"
+  access_token_ttl: 1h
+  refresh_token_ttl: 720h
+  api_key_prefix: "cnd_"
+  api_key_cache_ttl: 5m
+
+rate_limiting:
+  enabled: true
+  default_per_tenant: 1000
+  burst_multiplier: 1.5
+  fail_open: true
+
+audit:
+  enabled: true
+  buffer_size: 10000
+  flush_interval: 1s
+  redact_args: false
+  retention_days: 90
+
+observability:
+  otel_endpoint: ""
+  log_level: "info"
+  log_format: "console" # human-readable for local single-tenant testing
+  trace_sampling_rate: 1.0
+
+plugins:
+  dir: ""
+  http_timeout: 5s
+
+policy:
+  file: ""
+  reload_interval: 10s
+
+webhooks:
+  max_retries: 5
+  retry_backoff: "1s,5s,30s,5m,30m"
+  timeout: 10s

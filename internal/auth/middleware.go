@@ -7,7 +7,15 @@ import (
 	"strings"
 
 	"github.com/conduit-oss/conduit/internal/proxy"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// tracer returns Conduit's shared tracer. Declared per-package (rather than
+// exported from internal/proxy) since importing proxy's tracer() would add
+// no value here — otel.Tracer with the same name always returns an
+// equivalent Tracer instance, no matter which package asks for it.
+func tracer() trace.Tracer { return otel.Tracer("conduit") }
 
 // errorResponse mirrors proxy.ErrorResponse's JSON shape. Duplicated here
 // (rather than importing the type) because the fields Conduit's error
@@ -30,6 +38,9 @@ type errorResponse struct {
 func NewMiddleware(keyValidator *APIKeyValidator, jwtValidator *JWTValidator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, span := tracer().Start(r.Context(), "conduit.auth")
+			defer span.End()
+
 			token, ok := extractBearer(r)
 			if !ok {
 				if r.Header.Get("Authorization") == "" {
@@ -46,22 +57,26 @@ func NewMiddleware(keyValidator *APIKeyValidator, jwtValidator *JWTValidator) fu
 				authMethod string
 			)
 
+			cacheCtx, cacheSpan := tracer().Start(ctx, "conduit.auth.cache_lookup")
 			if IsAPIKey(token) {
 				authMethod = "api_key"
-				tenantID, err = keyValidator.Validate(r.Context(), token)
+				tenantID, err = keyValidator.Validate(cacheCtx, token)
 			} else {
 				authMethod = "jwt"
-				tenantID, err = jwtValidator.Validate(r.Context(), token)
+				tenantID, err = jwtValidator.Validate(cacheCtx, token)
 			}
+			cacheSpan.End()
 
 			if err != nil {
+				proxy.AuthDecisionsTotal.WithLabelValues(authMethod, "deny").Inc()
 				writeAuthError(w, r, err)
 				return
 			}
+			proxy.AuthDecisionsTotal.WithLabelValues(authMethod, "allow").Inc()
 
-			ctx := proxy.WithTenantID(r.Context(), tenantID)
-			ctx = proxy.WithAuthMethod(ctx, authMethod)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			reqCtx := proxy.WithTenantID(r.Context(), tenantID)
+			reqCtx = proxy.WithAuthMethod(reqCtx, authMethod)
+			next.ServeHTTP(w, r.WithContext(reqCtx))
 		})
 	}
 }

@@ -106,6 +106,7 @@ func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
 func standardChain(auth, rateLimit Middleware, plugins *plugin.Registry) []Middleware {
 	return []Middleware{
 		RequestIDMiddleware,
+		TracingMiddleware, // opens conduit.request; everything below runs inside it
 		LoggingMiddleware,
 		RecoveryMiddleware,
 		auth,

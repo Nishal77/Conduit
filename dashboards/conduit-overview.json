@@ -1,0 +1,99 @@
+{
+  "title": "Conduit Overview",
+  "uid": "conduit-overview",
+  "tags": ["conduit"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests/sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "rate(conduit_tool_calls_total[1m])", "legendFormat": "{{tool_name}}" }]
+    },
+    {
+      "id": 2,
+      "title": "P99 Proxy Latency",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "histogram_quantile(0.99, rate(conduit_proxy_latency_seconds_bucket[5m]))" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "P99 Upstream Latency",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "histogram_quantile(0.99, rate(conduit_upstream_latency_seconds_bucket[5m]))" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [{ "expr": "rate(conduit_tool_calls_total{status=\"error\"}[1m])" }]
+    },
+    {
+      "id": 5,
+      "title": "Rate Limited Requests",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [{ "expr": "rate(conduit_rate_limit_decisions_total{result=\"deny\"}[1m])" }]
+    },
+    {
+      "id": 6,
+      "title": "Policy Denials",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [{ "expr": "rate(conduit_policy_decisions_total{action=\"deny\"}[1m])" }]
+    },
+    {
+      "id": 7,
+      "title": "Active Connections",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+      "targets": [{ "expr": "sum(conduit_active_connections)" }]
+    },
+    {
+      "id": 8,
+      "title": "Audit Buffer Usage",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
+      "targets": [{ "expr": "conduit_audit_buffer_usage" }]
+    },
+    {
+      "id": 9,
+      "title": "Audit Events Dropped",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [{ "expr": "increase(conduit_audit_events_dropped_total[1h])" }]
+    },
+    {
+      "id": 10,
+      "title": "Top Tools",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [{ "expr": "topk(10, sum by (tool_name) (rate(conduit_tool_calls_total[5m])))" }]
+    },
+    {
+      "id": 11,
+      "title": "Top Tenants",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [{ "expr": "topk(10, sum by (tenant_id) (rate(conduit_tool_calls_total[5m])))" }]
+    },
+    {
+      "id": 12,
+      "title": "Build Version",
+      "type": "text",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 32 },
+      "targets": [{ "expr": "conduit_build_info" }],
+      "options": { "mode": "markdown", "content": "{{ range query \"conduit_build_info\" }}version={{ .Labels.version }} commit={{ .Labels.commit }}{{ end }}" }
+    }
+  ]
+}

@@ -95,6 +95,7 @@ func (w *Writer) Write(e Event) {
 	e.CreatedAt = time.Now().UTC()
 	select {
 	case w.ch <- e:
+		AuditBufferUsage.WithLabelValues().Set(float64(len(w.ch)))
 	default:
 		w.recordDrop()
 	}
@@ -109,6 +110,8 @@ func (w *Writer) Dropped() int64 {
 }
 
 func (w *Writer) recordDrop() {
+	AuditEventsDropped.WithLabelValues().Inc()
+
 	w.droppedMu.Lock()
 	defer w.droppedMu.Unlock()
 	w.dropped++

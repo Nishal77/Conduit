@@ -448,7 +448,7 @@ Update this table as phases complete:
 |---|---|---|---|
 | P1 | Repository & Core Proxy | 1–4 | ✅ Complete |
 | P2 | Auth, Rate Limiting & Database | 5–8 | ✅ Complete |
-| P3 | Audit Log, CLI & Docker (MVP 🚀) | 9–12 | ⬜ Not started |
+| P3 | Audit Log, CLI & Docker (MVP 🚀) | 9–12 | ✅ Complete |
 | P4 | Management API & TypeScript Dashboard | 13–16 | ⬜ Not started |
 | P5 | OAuth 2.0 & Multi-Tenant Routing | 17–20 | ⬜ Not started |
 | P6 | Plugin System & Policy Engine | 21–24 | ⬜ Not started |
@@ -1099,11 +1099,50 @@ docs(cli): add --json flag documentation for all commands
   use miniredis (real Lua script execution, no network). `go test -race ./...` clean,
   `gofmt`/`go vet` clean.
 
+- **Phase 3 complete (MVP milestone)**: `migrations/000002_audit_table` (partitioned
+  `audit_events`, 12 monthly partitions through end of 2026, 4 indexes). `internal/store/audit.go`
+  (`AuditStore.BatchInsert` via pgx batch protocol, `Query` with tenant/time/tool/server
+  filters + pagination, `Stream` via 500ms polling — spec's approved simpler
+  alternative to LISTEN/NOTIFY for this phase). `internal/audit` gained `query.go`
+  (`Query`/`ExportCSV`, excludes request_args/response_meta from CSV per spec) and
+  `postgres_sink.go` (`PostgresSink` adapter converting `audit.Event` → `store.AuditEvent`;
+  `main.go` picks it over Phase 1's `LogSink` automatically once PostgreSQL connects).
+  `proxy.go`'s audit write now populates `RequestArgs` (honors `audit.redact_args`) and
+  `ResponseMeta` (`{status, content_blocks}`) for the JSON path.
+  Full CLI split across `cmd/conduit/{apikey,audit,migrate,version}_cmd.go`:
+  `apikey create/list/revoke` (list --json uses a dedicated DTO so `key_hash` never
+  leaks), `audit tail/query/export` (table/json/csv), `migrate` gained `--down/--steps/--version`
+  (`store.Migrator` wraps golang-migrate with all four operations), `version --json`.
+  Added `config.LoadPartial` (skips `Validate()`) so admin commands don't require
+  `auth.jwt_secret` just to touch the database — caught this as a real bug during
+  live testing (`apikey revoke` failed with a JWT validation error). 13 Prometheus
+  metrics: 9 in `internal/proxy/metrics.go`, and `audit_buffer_usage`/`audit_events_dropped_total`
+  (in `internal/audit`), `plugin_latency_seconds` (in `internal/plugin`), `tenants_active`
+  (in `internal/tenant`) — split across packages specifically to avoid import cycles
+  (proxy imports all three of those packages), same metric names/namespace either way.
+  Metrics served on `:9090` via a second `http.Server` in `proxy_cmd.go`. OTel tracing
+  (`internal/tracing.Setup`, no-op when `otel_endpoint` unset) with the full span tree
+  from spec/09-observability.md §3: `conduit.request` (root, via new `TracingMiddleware`) →
+  `conduit.auth`/`conduit.auth.cache_lookup`, `conduit.ratelimit`/`conduit.ratelimit.lua`,
+  `conduit.upstream`, `conduit.audit.write`. `docker/Dockerfile` (3-stage: builder →
+  migrator target → distroless/static nonroot final), `docker/docker-compose.yml`
+  (postgres + redis + migrate + conduit with healthchecks), `k6/load-test.js` (1000 RPS
+  constant-arrival-rate scenario against a live route), `dashboards/conduit-overview.json`
+  (12 panels per spec), `examples/single-tenant/conduit.yaml`.
+  Verified end-to-end against real local PostgreSQL + Redis (native `pg_ctl`/`redis-server`,
+  no Docker daemon available in this session): `conduit migrate` created the schema and
+  reports version correctly, `apikey create/list/revoke` round-trip through Postgres,
+  a live tool call produced a row in `audit_events` with correct `request_args`/`response_meta`,
+  `audit query` (table/json/csv) and `audit tail` (live poll) both read it back correctly,
+  `/metrics` exposed `conduit_tool_calls_total`, `conduit_auth_decisions_total`, and
+  `conduit_proxy_latency_seconds` with real observed values, `conduit version --json`
+  works. `go test -race ./...` and the testcontainers-go integration suite (run against
+  the same local instances via `TEST_DATABASE_URL`/`TEST_REDIS_URL`) both clean.
+
 **Next action:**
-- Start Phase 3: audit log persistence (PostgreSQL-backed Sink replacing LogSink),
-  full CLI (`conduit audit tail/query/export`, `apikey create/list/revoke`),
-  Prometheus metrics, Docker packaging (MVP milestone)
-- Read `spec/07-audit.md`, `spec/08-cli.md`, `spec/09-observability.md` first
+- Start Phase 4: REST management API (chi router, `/api/v1/...`, full CRUD for
+  tenants/api-keys/servers/rate-limits/audit/webhooks/oauth) and the Next.js dashboard
+- Read `spec/10-api.md`, `spec/11-dashboard.md` first
 
 ---
 

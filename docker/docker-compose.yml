@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: conduit
+      POSTGRES_PASSWORD: conduit
+      POSTGRES_DB: conduit
+    ports:
+      - "5432:5432"
+    volumes:
+      - conduit-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conduit"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: migrator
+    environment:
+      DATABASE_URL: postgres://conduit:conduit@postgres:5432/conduit?sslmode=disable
+    command: ["--db-url", "postgres://conduit:conduit@postgres:5432/conduit?sslmode=disable"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  conduit:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-random-32-plus-character-secret}
+      DATABASE_URL: postgres://conduit:conduit@postgres:5432/conduit?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      CONDUIT_LOG_FORMAT: json
+    ports:
+      - "8080:8080" # MCP proxy
+      - "8081:8081" # management API (Phase 4)
+      - "9090:9090" # Prometheus metrics
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  conduit-postgres-data:

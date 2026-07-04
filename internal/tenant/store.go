@@ -89,6 +89,7 @@ func (s *Store) reload(ctx context.Context) error {
 	}
 
 	servers := make([]*Server, 0, len(rows))
+	tenantSlugs := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
 		servers = append(servers, &Server{
 			TenantSlug:  row.TenantSlug,
@@ -96,9 +97,11 @@ func (s *Store) reload(ctx context.Context) error {
 			UpstreamURL: row.UpstreamURL,
 			Enabled:     row.Enabled,
 		})
+		tenantSlugs[row.TenantSlug] = struct{}{}
 	}
 
 	s.router.ReplaceAll(servers)
-	s.log.Debug().Int("server_count", len(servers)).Msg("routing table refreshed")
+	TenantsActive.WithLabelValues().Set(float64(len(tenantSlugs)))
+	s.log.Debug().Int("server_count", len(servers)).Int("tenant_count", len(tenantSlugs)).Msg("routing table refreshed")
 	return nil
 }

@@ -250,26 +250,44 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := p.transport.RoundTrip(upstreamReq)
+	upstreamCtx, upstreamSpan := StartUpstreamSpan(r.Context())
+	upstreamStart := time.Now()
+	resp, err := p.transport.RoundTrip(upstreamReq.WithContext(upstreamCtx))
+	RecordUpstreamLatency(tenantSlug, serverName, time.Since(upstreamStart))
+	upstreamSpan.End()
 	if err != nil {
 		p.log.Warn().Err(err).Str("server", serverName).Msg("upstream request failed")
+		RecordUpstreamError(tenantSlug, serverName, classifyUpstreamError(err))
 		writeError(w, r, http.StatusBadGateway, "upstream request failed")
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	tenantID := TenantIDFromContext(r.Context()) // set once Phase 2 auth lands; "" today
+	tenantID := TenantIDFromContext(r.Context())
 	statusCode := resp.StatusCode
 
+	var responseMeta map[string]any
 	if isSSE(resp) {
+		// SSE responses stream a sequence of events rather than one JSON
+		// object, so there's no single "the response" to summarize here —
+		// responseMeta stays nil for streamed tool calls. status_code and
+		// latency_ms (recorded below) still capture the call's outcome.
 		if err := p.sse.Forward(r.Context(), w, resp, callReq, tenantID); err != nil {
 			p.log.Warn().Err(err).Msg("sse forward ended with error")
 		}
 	} else {
-		statusCode = p.forwardJSON(w, resp, callReq, tenantID)
+		statusCode, responseMeta = p.forwardJSON(w, resp, callReq, tenantID)
 	}
 
-	p.writeAudit(r, callReq, tenantSlug, serverName, tenantID, statusCode, start)
+	toolName := ""
+	if callReq != nil {
+		toolName = mcp.ExtractToolName(callReq)
+	}
+	SetRequestSpanAttributes(r.Context(), tenantID, serverName, toolName, AuthMethodFromContext(r.Context()), "allow", statusCode)
+	RecordToolCall(tenantID, serverName, toolName, statusCode, "allow")
+	RecordProxyLatency(tenantID, time.Since(start))
+
+	p.writeAudit(r, callReq, tenantSlug, serverName, tenantID, statusCode, responseMeta, start)
 }
 
 // buildUpstreamRequest constructs the outbound request to srv.UpstreamURL,
@@ -315,17 +333,21 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, srv *tenant.Server, body [
 // plugin.After, write it back to the agent. Used for methods like
 // tools/list whose upstream response is a single JSON object rather than a
 // stream.
-func (p *Proxy) forwardJSON(w http.ResponseWriter, resp *http.Response, callReq *mcp.Message, tenantID string) int {
+// forwardJSON handles the non-SSE response path: read the full body, run
+// plugin.After, write it back to the agent, and return both the status
+// code and a response_meta summary for the audit event.
+func (p *Proxy) forwardJSON(w http.ResponseWriter, resp *http.Response, callReq *mcp.Message, tenantID string) (int, map[string]any) {
 	body, err := readBodyLimited(resp.Body)
 	if err != nil {
 		p.log.Warn().Err(err).Msg("failed to read upstream response body")
 		w.WriteHeader(http.StatusBadGateway)
-		return http.StatusBadGateway
+		return http.StatusBadGateway, nil
 	}
 
 	respMsg, parseErr := mcp.ParseMessage(body)
 	if parseErr == nil && callReq != nil {
 		if modified := p.plugins.RunAfter(context.Background(), tenantID, callReq, respMsg); modified != nil {
+			respMsg = modified
 			if out, err := json.Marshal(modified); err == nil {
 				body = out
 			}
@@ -335,13 +357,56 @@ func (p *Proxy) forwardJSON(w http.ResponseWriter, resp *http.Response, callReq 
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
-	return resp.StatusCode
+
+	var responseMeta map[string]any
+	if parseErr == nil {
+		responseMeta = summarizeResponse(respMsg)
+	}
+	return resp.StatusCode, responseMeta
+}
+
+// summarizeResponse builds the response_meta audit field: whether the call
+// succeeded and how many content blocks it returned, without storing the
+// actual (potentially large or sensitive) tool output.
+func summarizeResponse(msg *mcp.Message) map[string]any {
+	if msg.Error != nil {
+		return map[string]any{"status": "error"}
+	}
+	var result mcp.ToolCallResult
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		// Not a tools/call result shape (e.g. tools/list) — still worth
+		// recording that the call succeeded.
+		return map[string]any{"status": "success"}
+	}
+	status := "success"
+	if result.IsError {
+		status = "error"
+	}
+	return map[string]any{"status": status, "content_blocks": len(result.Content)}
+}
+
+// extractRequestArgs pulls the tools/call arguments out of callReq for the
+// audit event, honoring audit.redact_args — when set, Conduit records that
+// a tool was called without persisting what it was called with.
+func extractRequestArgs(callReq *mcp.Message, redact bool) map[string]any {
+	if callReq == nil || redact || callReq.Method != "tools/call" {
+		return nil
+	}
+	var params mcp.ToolCallParams
+	if err := json.Unmarshal(callReq.Params, &params); err != nil {
+		return nil
+	}
+	var args map[string]any
+	if err := json.Unmarshal(params.Arguments, &args); err != nil {
+		return nil
+	}
+	return args
 }
 
 // writeAudit builds and enqueues the audit event for this request. It never
 // blocks — Writer.Write is a non-blocking channel send (ADR-002) — so
 // calling it as the very last step of forward() adds negligible latency.
-func (p *Proxy) writeAudit(r *http.Request, callReq *mcp.Message, tenantSlug, serverName, tenantID string, statusCode int, start time.Time) {
+func (p *Proxy) writeAudit(r *http.Request, callReq *mcp.Message, tenantSlug, serverName, tenantID string, statusCode int, responseMeta map[string]any, start time.Time) {
 	if p.auditor == nil {
 		return
 	}
@@ -350,8 +415,11 @@ func (p *Proxy) writeAudit(r *http.Request, callReq *mcp.Message, tenantSlug, se
 		toolName = mcp.ExtractToolName(callReq)
 	}
 	if tenantID == "" {
-		tenantID = tenantSlug // Phase 1 fallback until real auth resolves tenant_id.
+		tenantID = tenantSlug // Phase 1/2 fallback when auth isn't configured.
 	}
+
+	_, auditSpan := StartAuditWriteSpan(r.Context())
+	defer auditSpan.End()
 
 	p.auditor.Write(audit.Event{
 		TenantID:     tenantID,
@@ -359,10 +427,12 @@ func (p *Proxy) writeAudit(r *http.Request, callReq *mcp.Message, tenantSlug, se
 		SessionID:    RequestIDFromContext(r.Context()),
 		ServerName:   serverName,
 		ToolName:     toolName,
+		RequestArgs:  extractRequestArgs(callReq, p.cfg.Audit.RedactArgs),
+		ResponseMeta: responseMeta,
 		StatusCode:   statusCode,
 		LatencyMs:    int(time.Since(start).Milliseconds()),
 		AuthMethod:   AuthMethodFromContext(r.Context()),
 		PolicyAction: "allow", // Phase 6 policy engine sets deny/rate_limited
-		TraceID:      "",      // Phase 7 OTel wiring populates this
+		TraceID:      TraceIDFromContext(r.Context()),
 	})
 }
