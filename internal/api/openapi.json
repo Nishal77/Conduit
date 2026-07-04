@@ -1,0 +1,177 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Conduit Management API",
+    "version": "0.1.0",
+    "description": "CRUD for tenants, API keys, MCP servers, rate limits, and audit log queries. Runs on its own port so it can be isolated from agent traffic."
+  },
+  "servers": [{ "url": "/api/v1" }],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "code": { "type": "string" },
+          "request_id": { "type": "string" },
+          "details": { "type": "object", "additionalProperties": { "type": "string" } }
+        },
+        "required": ["error", "code", "request_id"]
+      },
+      "Tenant": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "slug": { "type": "string" },
+          "name": { "type": "string" },
+          "plan": { "type": "string", "enum": ["free", "pro", "enterprise"] },
+          "settings": { "type": "object" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "APIKey": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenant_id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "key_prefix": { "type": "string" },
+          "scopes": { "type": "array", "items": { "type": "string" } },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "last_used_at": { "type": ["string", "null"], "format": "date-time" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MCPServer": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenant_id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "upstream_url": { "type": "string" },
+          "auth_type": { "type": "string", "enum": ["none", "bearer", "basic", "api_key"] },
+          "health_check_url": { "type": "string" },
+          "weight": { "type": "integer" },
+          "enabled": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RateLimitConfig": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenant_id": { "type": "string", "format": "uuid" },
+          "scope": { "type": "string", "enum": ["tenant", "server", "tool", "agent"] },
+          "target": { "type": ["string", "null"] },
+          "requests": { "type": "integer" },
+          "window_sec": { "type": "integer" },
+          "burst": { "type": ["integer", "null"] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AuditEvent": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenant_id": { "type": "string", "format": "uuid" },
+          "server_name": { "type": "string" },
+          "tool_name": { "type": "string" },
+          "status_code": { "type": "integer" },
+          "latency_ms": { "type": "integer" },
+          "auth_method": { "type": "string", "enum": ["api_key", "jwt"] },
+          "policy_action": { "type": "string", "enum": ["allow", "deny", "rate_limited"] },
+          "cost_usd": { "type": "string" },
+          "trace_id": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  },
+  "security": [{ "bearerAuth": [] }],
+  "paths": {
+    "/health": {
+      "get": { "summary": "Liveness check", "security": [], "responses": { "200": { "description": "OK" } } }
+    },
+    "/tenants": {
+      "get": {
+        "summary": "List active tenants",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Tenant" } } } } } } } }
+      },
+      "post": {
+        "summary": "Create a tenant",
+        "responses": {
+          "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Tenant" } } } },
+          "409": { "description": "Slug already taken", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+        }
+      }
+    },
+    "/tenants/{tenantID}": {
+      "get": { "summary": "Get a tenant", "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } } },
+      "patch": { "summary": "Update a tenant", "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } } },
+      "delete": { "summary": "Soft-delete a tenant", "responses": { "204": { "description": "No Content" }, "404": { "description": "Not found" } } }
+    },
+    "/api-keys": {
+      "get": { "summary": "List API keys for a tenant", "parameters": [{ "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "200": { "description": "OK" } } },
+      "post": { "summary": "Create an API key (raw key returned once)", "responses": { "201": { "description": "Created" } } }
+    },
+    "/api-keys/{keyID}": {
+      "delete": { "summary": "Revoke an API key", "responses": { "204": { "description": "No Content" }, "404": { "description": "Not found" } } }
+    },
+    "/servers": {
+      "get": { "summary": "List MCP servers for a tenant", "parameters": [{ "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "200": { "description": "OK" } } },
+      "post": { "summary": "Register an MCP server", "responses": { "201": { "description": "Created" }, "409": { "description": "Name already taken for this tenant" } } }
+    },
+    "/servers/{serverID}": {
+      "get": { "summary": "Get a server", "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } } },
+      "patch": { "summary": "Update a server", "responses": { "200": { "description": "OK" }, "404": { "description": "Not found" } } },
+      "delete": { "summary": "Remove a server", "responses": { "204": { "description": "No Content" }, "404": { "description": "Not found" } } }
+    },
+    "/servers/{serverID}/health": {
+      "get": { "summary": "Ping the server's configured health_check_url", "responses": { "200": { "description": "OK" } } }
+    },
+    "/rate-limits": {
+      "get": { "summary": "List rate limit configs for a tenant", "parameters": [{ "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } }], "responses": { "200": { "description": "OK" } } },
+      "put": { "summary": "Create or update a rate limit config", "responses": { "200": { "description": "OK" } } }
+    },
+    "/rate-limits/{id}": {
+      "delete": { "summary": "Delete a rate limit config", "responses": { "204": { "description": "No Content" }, "404": { "description": "Not found" } } }
+    },
+    "/audit/events": {
+      "get": {
+        "summary": "Paginated audit log query",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "from", "in": "query", "schema": { "type": "string" } },
+          { "name": "to", "in": "query", "schema": { "type": "string" } },
+          { "name": "tool_name", "in": "query", "schema": { "type": "string" } },
+          { "name": "server_name", "in": "query", "schema": { "type": "string" } },
+          { "name": "policy_action", "in": "query", "schema": { "type": "string", "enum": ["allow", "deny", "rate_limited"] } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 50, "maximum": 500 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/audit/export": {
+      "get": {
+        "summary": "Streaming CSV or JSON export of matching events",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "format", "in": "query", "schema": { "type": "string", "enum": ["csv", "json"], "default": "csv" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/audit/stream": {
+      "get": {
+        "summary": "SSE live stream of new audit events for a tenant",
+        "parameters": [{ "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": {} } } }
+      }
+    }
+  }
+}

@@ -6,13 +6,26 @@ Kong / Traefik for AI agent tool calls — Conduit sits between AI agents and
 your upstream MCP servers, enforcing authentication, rate limiting, policy,
 and audit logging on every tool call, with sub-millisecond overhead.
 
-> Status: pre-alpha, MVP milestone reached. Phases 1–3 are implemented: core
-> reverse proxy, SSE streaming, PostgreSQL-backed routing, API key
-> authentication, Redis rate limiting, persisted audit log, the full CLI
-> (`apikey`, `audit`, `migrate`, `version`), Prometheus metrics, OpenTelemetry
-> tracing, and Docker packaging. Phases 4–9 (management API, dashboard,
-> OAuth, plugins, Kubernetes, enterprise features) are in progress. See
-> [CLAUDE.md](claude.md) for the full build plan and phase status.
+> Status: pre-alpha. Phases 1–4 are implemented: core reverse proxy, SSE
+> streaming, PostgreSQL-backed routing, API key authentication, Redis rate
+> limiting, persisted audit log, the full CLI, Prometheus metrics,
+> OpenTelemetry tracing, Docker packaging, a REST management API, and a
+> Next.js dashboard. Phases 5–9 (OAuth, plugins, Kubernetes, enterprise
+> features) are in progress. See [CLAUDE.md](claude.md) for the full build
+> plan and phase status.
+
+## Dashboard
+
+```bash
+cd dashboard
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`, sign in with the management API URL
+(`http://localhost:8081` by default), a tenant slug, and an API key created
+via `conduit apikey create`. See [spec/11-dashboard.md](spec/11-dashboard.md)
+for the full page list.
 
 ## Why
 

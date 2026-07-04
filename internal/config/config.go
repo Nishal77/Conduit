@@ -37,6 +37,11 @@ type ServerConfig struct {
 	MetricsPort    int           `mapstructure:"metrics_port"`
 	TLS            TLSConfig     `mapstructure:"tls"`
 	Timeouts       TimeoutConfig `mapstructure:"timeouts"`
+	// CORSOrigins lists origins allowed to call the management API
+	// (spec/10-api.md §6) — typically the dashboard's own origin in
+	// production. Empty means "allow any origin," which is fine for local
+	// development but should always be set explicitly in production.
+	CORSOrigins []string `mapstructure:"cors_origins"`
 }
 
 // TLSConfig configures optional TLS termination on the proxy listener.

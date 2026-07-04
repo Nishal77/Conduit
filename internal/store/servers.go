@@ -64,6 +64,27 @@ func (s *MCPServerStore) GetByTenantAndName(ctx context.Context, tenantID uuid.U
 	return srv, nil
 }
 
+// GetByID returns a server by its primary key, regardless of enabled
+// state — used by the management API, which needs to display and manage
+// disabled servers too (unlike the proxy's routing path, which only ever
+// wants enabled ones).
+func (s *MCPServerStore) GetByID(ctx context.Context, id uuid.UUID) (*MCPServer, error) {
+	row := s.db.Pool.QueryRow(ctx, `
+		SELECT `+mcpServerColumns+`
+		FROM mcp_servers
+		WHERE id = $1
+	`, id)
+
+	srv, err := scanMCPServer(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get mcp server by id: %w", err)
+	}
+	return srv, nil
+}
+
 // ListByTenant returns every enabled server for a tenant.
 func (s *MCPServerStore) ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]*MCPServer, error) {
 	rows, err := s.db.Pool.Query(ctx, `

@@ -449,7 +449,7 @@ Update this table as phases complete:
 | P1 | Repository & Core Proxy | 1–4 | ✅ Complete |
 | P2 | Auth, Rate Limiting & Database | 5–8 | ✅ Complete |
 | P3 | Audit Log, CLI & Docker (MVP 🚀) | 9–12 | ✅ Complete |
-| P4 | Management API & TypeScript Dashboard | 13–16 | ⬜ Not started |
+| P4 | Management API & TypeScript Dashboard | 13–16 | ✅ Complete |
 | P5 | OAuth 2.0 & Multi-Tenant Routing | 17–20 | ⬜ Not started |
 | P6 | Plugin System & Policy Engine | 21–24 | ⬜ Not started |
 | P7 | Kubernetes, SDKs & Full Observability | 25–28 | ⬜ Not started |
@@ -1139,10 +1139,43 @@ docs(cli): add --json flag documentation for all commands
   works. `go test -race ./...` and the testcontainers-go integration suite (run against
   the same local instances via `TEST_DATABASE_URL`/`TEST_REDIS_URL`) both clean.
 
+- **Phase 4 complete**: `internal/api` (chi router on `:8081`) with handlers for tenants,
+  api-keys, servers (+ live health check), rate-limits, and audit (query/export/SSE stream)
+  — exactly matching spec/10-api.md's JSON shapes and pagination envelope. Webhooks, OAuth
+  application, and plugin routes are intentionally not wired up: their backing tables
+  (`webhook_configs`, `oauth_applications`, `tenant_plugins`) don't exist until migrations
+  000003 (Phase 5) and 000004 (Phase 6) — documented on `internal/api/handlers`'s package
+  comment rather than stubbed. Auth uses Conduit API keys (not JWT — spec's original design
+  assumed Phase 5's OAuth server already existed); documented as a real, narrower-than-final
+  auth boundary in `internal/api/middleware/auth.go`. Added `config.LoadPartial` (skips
+  `Validate()`) so `apikey`/`audit`/`migrate` CLI commands don't need `auth.jwt_secret` just
+  to touch the database — a real bug caught during live testing. OpenAPI 3.1 spec is
+  hand-written (`internal/api/openapi.json`, embedded) rather than swaggo-generated, since
+  swaggo's codegen needs a build step this environment doesn't have wired up.
+  `dashboard/`: full Next.js 15 (pinned; `create-next-app@latest` defaults to 16) + TypeScript
+  + Tailwind v4 + hand-built shadcn/ui-style primitives (couldn't run `shadcn init`
+  interactively in this environment, so components are hand-written matching shadcn's
+  standard Radix-based implementation). All 6 pages from spec/11-dashboard.md: `/traffic`
+  (live SSE feed), `/audit` (filters + pagination + CSV export), `/api-keys` (create/revoke,
+  one-time key reveal), `/servers` (register/remove + polling health badge), `/rate-limits`
+  (scoped CRUD with a live rate preview), `/plugins` (honest "Phase 6" placeholder — no fake
+  UI for endpoints that don't exist). Login is a simple API-key-paste form rather than
+  spec's cookie-based JWT flow, since `/api/v1/auth/login` doesn't exist until Phase 5 — see
+  `lib/auth.ts`'s doc comment. Live traffic streaming uses `fetch` + `ReadableStream` instead
+  of `EventSource`, since `EventSource` can't send an `Authorization` header (see `lib/api.ts`'s
+  `streamAuditEvents`). Added `dashboard/go.mod` as a nested module boundary so `go build ./...`
+  from the repo root doesn't descend into `dashboard/node_modules` (an npm package there ships
+  an incidental `.go` file with no `go.mod` of its own). `npm run build` and `npm run lint`
+  both clean; verified the entire dashboard end-to-end in a real browser against the live
+  Go backend (login, live traffic feed receiving a real tool call, audit log with filters,
+  API key create-reveal-copy flow, server registration, rate limit CRUD) with zero console
+  errors. `go test -race ./...` clean.
+
 **Next action:**
-- Start Phase 4: REST management API (chi router, `/api/v1/...`, full CRUD for
-  tenants/api-keys/servers/rate-limits/audit/webhooks/oauth) and the Next.js dashboard
-- Read `spec/10-api.md`, `spec/11-dashboard.md` first
+- Start Phase 5: OAuth 2.0 server (authorization code + PKCE + client credentials),
+  JWT issuance (finally makes internal/auth's JWTValidator real), dynamic multi-tenant
+  routing refinements, RBAC (`users`, `tenant_members` tables)
+- Read `spec/12-oauth.md`, `spec/13-multitenant.md` first
 
 ---
 
