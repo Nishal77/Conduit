@@ -107,8 +107,6 @@ func writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
 		writeUnauthorized(w, r, "JWT has expired")
 	case errors.Is(err, ErrInvalidAPIKey):
 		writeUnauthorized(w, r, "invalid API key")
-	case errors.Is(err, ErrJWTNotSupported):
-		writeUnauthorizedCode(w, r, "JWT authentication is not yet configured", "JWT_NOT_SUPPORTED")
 	case errors.Is(err, ErrInvalidJWT):
 		writeUnauthorized(w, r, "invalid JWT")
 	default:

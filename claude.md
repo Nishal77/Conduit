@@ -450,7 +450,7 @@ Update this table as phases complete:
 | P2 | Auth, Rate Limiting & Database | 5–8 | ✅ Complete |
 | P3 | Audit Log, CLI & Docker (MVP 🚀) | 9–12 | ✅ Complete |
 | P4 | Management API & TypeScript Dashboard | 13–16 | ✅ Complete |
-| P5 | OAuth 2.0 & Multi-Tenant Routing | 17–20 | ⬜ Not started |
+| P5 | OAuth 2.0 & Multi-Tenant Routing | 17–20 | ✅ Complete |
 | P6 | Plugin System & Policy Engine | 21–24 | ⬜ Not started |
 | P7 | Kubernetes, SDKs & Full Observability | 25–28 | ⬜ Not started |
 | P8 | Enterprise Features | 29–40 | ⬜ Not started |
@@ -1171,11 +1171,71 @@ docs(cli): add --json flag documentation for all commands
   API key create-reveal-copy flow, server registration, rate limit CRUD) with zero console
   errors. `go test -race ./...` clean.
 
+- **Phase 5 complete**: `migrations/000003_oauth_tables` (`oauth_applications`,
+  `oauth_auth_codes`, `oauth_refresh_tokens`) matching spec/04-database.md §4.
+  `internal/store/oauth.go`: `OAuthApplicationStore` (create/get/list/update/rotate-secret/delete),
+  `OAuthAuthCodeStore` (`GetValidByHash` collapses not-found/used/expired into a single
+  `ErrNotFound` to avoid giving an attacker an oracle), `OAuthRefreshTokenStore`
+  (create/get-valid/revoke). `internal/store/crypto.go` (new): AES-256-GCM encryption
+  for `mcp_servers.auth_config` at rest, key derived from `auth.jwt_secret` via SHA-256
+  (`DeriveCredentialKey`) rather than a second secret to configure — `MCPServerStore`
+  encrypts on write and decrypts on every read/list, transparently to callers.
+  `internal/auth/jwt.go` rewritten: real HS256 sign/verify via jwx/v2 (`IssueAccessToken`,
+  `ParseClaims`, `Validate`), removing the Phase 1-4 `ErrJWTNotSupported` stub entirely
+  (dead code once real JWT support existed, not kept for compatibility).
+  `internal/auth/oauth.go` (new): `OAuthServer` implementing the authorization_code grant
+  with mandatory PKCE (S256 only), client_credentials, refresh_token rotation (old token
+  revoked, new one issued on every use), introspection, and revocation. Access tokens are
+  stateless signed JWTs; revoking one records its `jti` in a short-lived Redis blocklist
+  (`internal/auth/oauth.go`'s `blocklistJTI`/`isJTIRevoked`, fail-open on a Redis outage
+  per the same policy `internal/ratelimit` uses) rather than a database row, since there's
+  nothing to mark in a stateless token — introspection checks the blocklist, but the
+  proxy's own request-path JWT validation deliberately does not, to keep that hot path
+  free of a Redis round-trip; `access_token_ttl` bounds the exposure window instead.
+  `internal/api/handlers/oauth.go` (new): `/oauth/authorize`, `/oauth/token`,
+  `/oauth/introspect`, `/oauth/revoke`, and the RFC 8414 well-known metadata document, plus
+  `/api/v1/oauth/applications` CRUD. `/oauth/authorize` has no user/session model to render
+  consent with yet (that's Phase 8's SSO work), so it uses a Conduit API key as its own
+  approval signal via `?api_key=`, auto-approving once that key's tenant matches the OAuth
+  application's tenant — documented clearly as a placeholder in the handler's doc comment.
+  Found and fixed a real bug during live verification: the token endpoint's metadata
+  advertised `client_secret_basic` support but only ever read `client_id`/`client_secret`
+  from form fields, so an RFC-compliant client authenticating via the HTTP Basic header
+  got `invalid_client` — fixed with `clientCredentialsFromRequest`, which checks Basic
+  auth first and falls back to form fields.
+  Multi-tenant routing (`internal/tenant`): `Server` gained `TenantID`, `AuthType`,
+  `AuthConfig`, `Weight` fields populated from the now richer `MCPServerWithTenantSlug`
+  projection; `Router` now keys on (tenant, name) to a slice of servers rather than a
+  single one, so more than one upstream can share a name — `WeightedSelect` picks among
+  them with a cumulative-weight random walk (spec/13-multitenant.md §4). `proxy.forward`
+  now verifies the authenticated caller's tenant_id against the resolved server's real
+  `TenantID` and returns 403 on mismatch — the URL's tenant slug was previously only used
+  to look up a route, never checked against who was actually authenticated, which would
+  have let a valid caller for tenant A reach tenant B's servers by putting B's slug in the
+  path (ADR-004). `proxy.applyUpstreamAuth` injects `bearer`/`basic`/`api_key` credentials
+  into the outbound upstream request per spec/13-multitenant.md §6, logging only
+  `auth_type`, never the credential itself. `tenant.Store` gained `Invalidate`, called by
+  the management API's tenant/server handlers after every mutation so a change is
+  routable immediately rather than waiting up to the 5-second refresh tick.
+  Verified end-to-end against real local PostgreSQL and Redis: full authorization_code +
+  PKCE flow (authorize redirect, Basic-auth token exchange, introspect, refresh rotation
+  with old-token reuse rejected, revoke with post-revoke introspection now correctly
+  inactive) exercised over live HTTP against a running proxy and management API; two
+  tenants each registered a same-named upstream server, confirmed the bearer token
+  configured for one tenant's server was injected on its calls and not the other's, and
+  confirmed a valid API key for one tenant got a 403 when targeting the other tenant's
+  slug in the URL. `go build`/`go vet`/`gofmt` clean under both the default and
+  `integration` build tags, `go test -race ./...` clean, integration suite (`internal/store`,
+  `internal/auth`, including new `TestOAuthServer_RevokeAccessTokenWithBlocklist` and
+  `internal/tenant`'s new router/weighted-selection unit tests) run and passed against
+  live PostgreSQL/Redis. Dashboard `npm run build` still clean (untouched this phase).
+
 **Next action:**
-- Start Phase 5: OAuth 2.0 server (authorization code + PKCE + client credentials),
-  JWT issuance (finally makes internal/auth's JWTValidator real), dynamic multi-tenant
-  routing refinements, RBAC (`users`, `tenant_members` tables)
-- Read `spec/12-oauth.md`, `spec/13-multitenant.md` first
+- Start Phase 6: Plugin System & Policy Engine — `ConduitPlugin` interface is already in
+  place from Phase 1 (`internal/plugin`), so this phase is mostly the registry lifecycle,
+  the HTTP callback plugin, the five built-in plugins, and the YAML policy engine with
+  hot-reload
+- Read `spec/06-plugins.md`, `spec/07-policy.md` first
 
 ---
 

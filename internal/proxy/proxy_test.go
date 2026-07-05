@@ -13,6 +13,7 @@ import (
 	"github.com/conduit-oss/conduit/internal/config"
 	"github.com/conduit-oss/conduit/internal/plugin"
 	"github.com/conduit-oss/conduit/internal/tenant"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -129,6 +130,105 @@ func TestServeHTTP_ProxiesSSEResponse(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
 	assert.Contains(t, rec.Body.String(), `"text":"ok"`)
+}
+
+func TestServeHTTP_CrossTenantAccessForbidden(t *testing.T) {
+	p, router := newTestProxy(t, "")
+	acmeID := uuid.New()
+	router.Register(&tenant.Server{TenantID: acmeID, TenantSlug: "acme", Name: "github", UpstreamURL: "http://example.invalid", Enabled: true})
+
+	// A caller authenticated as some other tenant tries to reach acme's
+	// server by putting "acme" in the URL — this must be rejected even
+	// though the URL slug alone would resolve successfully.
+	req := httptest.NewRequest(http.MethodPost, "/mcp/acme/github", jsonBody(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	req = req.WithContext(WithTenantID(req.Context(), uuid.New().String()))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestServeHTTP_MatchingTenantAllowed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`))
+	}))
+	defer upstream.Close()
+
+	p, router := newTestProxy(t, "")
+	acmeID := uuid.New()
+	router.Register(&tenant.Server{TenantID: acmeID, TenantSlug: "acme", Name: "github", UpstreamURL: upstream.URL, Enabled: true})
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/acme/github", jsonBody(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	req = req.WithContext(WithTenantID(req.Context(), acmeID.String()))
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestApplyUpstreamAuth(t *testing.T) {
+	tests := []struct {
+		name    string
+		srv     *tenant.Server
+		wantErr bool
+		check   func(t *testing.T, req *http.Request)
+	}{
+		{
+			name: "none leaves request untouched",
+			srv:  &tenant.Server{Name: "s", AuthType: "none"},
+			check: func(t *testing.T, req *http.Request) {
+				assert.Empty(t, req.Header.Get("Authorization"))
+			},
+		},
+		{
+			name: "bearer sets Authorization header",
+			srv:  &tenant.Server{Name: "s", AuthType: "bearer", AuthConfig: map[string]any{"token": "secret-token"}},
+			check: func(t *testing.T, req *http.Request) {
+				assert.Equal(t, "Bearer secret-token", req.Header.Get("Authorization"))
+			},
+		},
+		{
+			name:    "bearer without a token errors",
+			srv:     &tenant.Server{Name: "s", AuthType: "bearer"},
+			wantErr: true,
+		},
+		{
+			name: "basic sets Authorization header",
+			srv:  &tenant.Server{Name: "s", AuthType: "basic", AuthConfig: map[string]any{"username": "u", "password": "p"}},
+			check: func(t *testing.T, req *http.Request) {
+				user, pass, ok := req.BasicAuth()
+				require.True(t, ok)
+				assert.Equal(t, "u", user)
+				assert.Equal(t, "p", pass)
+			},
+		},
+		{
+			name: "api_key sets the configured header",
+			srv:  &tenant.Server{Name: "s", AuthType: "api_key", AuthConfig: map[string]any{"key_header": "X-Api-Key", "key_value": "abc123"}},
+			check: func(t *testing.T, req *http.Request) {
+				assert.Equal(t, "abc123", req.Header.Get("X-Api-Key"))
+			},
+		},
+		{
+			name:    "unknown auth type errors",
+			srv:     &tenant.Server{Name: "s", AuthType: "oauth2"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://upstream.invalid/", nil)
+			err := applyUpstreamAuth(req, tt.srv)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			tt.check(t, req)
+		})
+	}
 }
 
 func TestMcpPathSegments(t *testing.T) {

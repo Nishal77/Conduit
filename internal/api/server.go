@@ -12,6 +12,7 @@ import (
 	"github.com/conduit-oss/conduit/internal/auth"
 	"github.com/conduit-oss/conduit/internal/config"
 	"github.com/conduit-oss/conduit/internal/store"
+	"github.com/conduit-oss/conduit/internal/tenant"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog"
@@ -25,10 +26,11 @@ type Server struct {
 }
 
 // New builds the chi router with every handler and middleware wired in.
-// keyValidator authenticates requests (see apimiddleware.Auth for why API
-// keys, not JWTs, until Phase 5).
-func New(cfg *config.Config, stores *store.Stores, keyValidator *auth.APIKeyValidator, log zerolog.Logger) *Server {
-	h := handlers.New(stores, log)
+// keyValidator authenticates /api/v1 requests (see apimiddleware.Auth for
+// why API keys, not JWTs). oauthServer and issuer wire up the OAuth 2.0
+// endpoints from spec/12-oauth.md. routing may be nil; see handlers.New.
+func New(cfg *config.Config, stores *store.Stores, oauthServer *auth.OAuthServer, keyValidator *auth.APIKeyValidator, issuer string, routing *tenant.Store, log zerolog.Logger) *Server {
+	h := handlers.New(stores, oauthServer, keyValidator, issuer, routing, log)
 	return &Server{router: buildRouter(cfg, h, keyValidator, log)}
 }
 
@@ -47,6 +49,18 @@ func buildRouter(cfg *config.Config, h *handlers.Handlers, keyValidator *auth.AP
 	r.Use(middleware.Recoverer)
 	r.Use(apimiddleware.CORS(cfg.Server.CORSOrigins))
 	r.Use(apimiddleware.JSONContentType)
+
+	// OAuth 2.0 endpoints (spec/12-oauth.md §2): unauthenticated by
+	// Conduit's own API-key scheme, since these ARE the endpoints that
+	// issue and manage credentials — /oauth/token and /oauth/introspect
+	// authenticate the caller themselves (client_id/secret), and
+	// /oauth/authorize uses a Conduit API key as its own approval signal
+	// (see OAuthHandler.Authorize's doc comment).
+	r.Get("/oauth/authorize", h.OAuth.Authorize)
+	r.Post("/oauth/token", h.OAuth.Token)
+	r.Post("/oauth/introspect", h.OAuth.Introspect)
+	r.Post("/oauth/revoke", h.OAuth.Revoke)
+	r.Get("/.well-known/oauth-authorization-server", h.OAuth.WellKnownMetadata)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		// Health — no auth required.
@@ -91,9 +105,17 @@ func buildRouter(cfg *config.Config, h *handlers.Handlers, keyValidator *auth.AP
 				r.Get("/stream", h.Audit.Stream)
 			})
 
-			// /webhooks, /plugins, and /oauth/applications are not wired
-			// up yet — see the package doc comment on internal/api/handlers
-			// for why (their tables land in Phases 5 and 6).
+			r.Route("/oauth/applications", func(r chi.Router) {
+				r.Get("/", h.OAuthApps.List)
+				r.Post("/", h.OAuthApps.Create)
+				r.Patch("/{id}", h.OAuthApps.Update)
+				r.Delete("/{id}", h.OAuthApps.Delete)
+				r.Post("/{id}/rotate-secret", h.OAuthApps.RotateSecret)
+			})
+
+			// /webhooks and /plugins are not wired up yet — see the
+			// package doc comment on internal/api/handlers for why (their
+			// tables land in Phase 6).
 		})
 	})
 

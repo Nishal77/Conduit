@@ -228,16 +228,24 @@ func wireDataLayer(ctx context.Context, cfg *config.Config, router *tenant.Route
 		return nil, sink, nil, cleanup
 	}
 
-	stores := store.NewStores(db)
+	stores := store.NewStores(db, store.DeriveCredentialKey(cfg.Auth.JWTSecret))
 
 	routingStore := tenant.NewStore(router, stores.Servers, logger)
 	if err := routingStore.Start(ctx); err != nil {
 		logger.Warn().Err(err).Msg("initial routing table load failed, continuing with an empty table")
 	}
 
+	// oauthIssuer identifies Conduit as a token issuer/authorization server
+	// (the JWT "iss" claim, and the base used to build RFC 8414 metadata
+	// endpoint URLs). It's a stable identifier, not necessarily Conduit's
+	// externally reachable URL — spec/12-oauth.md §5's own example uses the
+	// same literal value.
+	const oauthIssuer = "https://conduit"
+
 	keyValidator := auth.NewAPIKeyValidator(redisClient, stores.APIKeys, cfg.Auth.APIKeyCacheTTL)
-	jwtValidator := auth.NewJWTValidator(cfg.Auth.JWTSecret, "https://conduit")
+	jwtValidator := auth.NewJWTValidator(cfg.Auth.JWTSecret, oauthIssuer)
 	limiter := ratelimit.New(redisClient, stores.RateLimits, &cfg.RateLimit, logger)
+	oauthServer := auth.NewOAuthServer(stores.OAuthApps, stores.OAuthCodes, stores.OAuthRefresh, jwtValidator, redisClient, cfg.Auth.AccessTokenTTL, cfg.Auth.RefreshTokenTTL)
 
 	logger.Info().Msg("database and redis connected, auth, rate limiting, audit persistence, and management api enabled")
 
@@ -253,7 +261,7 @@ func wireDataLayer(ctx context.Context, cfg *config.Config, router *tenant.Route
 		proxy.WithReadyChecker(dbReadyChecker{db}),
 		proxy.WithReadyChecker(redisReadyChecker{redisClient}),
 	}
-	mgmtHandler = api.New(cfg, stores, keyValidator, logger)
+	mgmtHandler = api.New(cfg, stores, oauthServer, keyValidator, oauthIssuer, routingStore, logger)
 	return opts, audit.NewPostgresSink(stores.Audit), mgmtHandler, cleanup
 }
 

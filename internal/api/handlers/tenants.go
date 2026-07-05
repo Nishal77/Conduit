@@ -8,13 +8,32 @@ import (
 
 	"github.com/conduit-oss/conduit/internal/api/httpx"
 	"github.com/conduit-oss/conduit/internal/store"
+	"github.com/conduit-oss/conduit/internal/tenant"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
-// TenantsHandler implements /api/v1/tenants.
+// TenantsHandler implements /api/v1/tenants. routing is nil in Phase 1/2
+// deployments that don't run the database-backed tenant.Store; when set, it
+// is invalidated after every mutation per spec/13-multitenant.md §7 so a
+// renamed or deleted tenant is reflected in routing immediately rather than
+// after the next 5-second refresh tick.
 type TenantsHandler struct {
 	tenants *store.TenantStore
+	routing *tenant.Store
+}
+
+// invalidateRouting forces an immediate routing-table reload, logging (but
+// not failing the request on) any error — a stale-for-a-few-seconds table
+// is an acceptable degradation, not a reason to fail a successful write.
+func invalidateRouting(routing *tenant.Store, r *http.Request) {
+	if routing == nil {
+		return
+	}
+	if err := routing.Invalidate(r.Context()); err != nil {
+		log.Warn().Err(err).Msg("failed to invalidate routing table after tenant/server change")
+	}
 }
 
 // tenantJSON is the exact response shape spec/10-api.md §3 documents.
@@ -99,6 +118,7 @@ func (h *TenantsHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	invalidateRouting(h.routing, r)
 	httpx.WriteJSON(w, http.StatusCreated, toTenantJSON(tenant))
 }
 
@@ -173,6 +193,7 @@ func (h *TenantsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "failed to update tenant")
 		return
 	}
+	invalidateRouting(h.routing, r)
 	httpx.WriteJSON(w, http.StatusOK, toTenantJSON(tenant))
 }
 
@@ -190,6 +211,7 @@ func (h *TenantsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "failed to delete tenant")
 		return
 	}
+	invalidateRouting(h.routing, r)
 	w.WriteHeader(http.StatusNoContent)
 }
 

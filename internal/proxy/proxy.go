@@ -233,6 +233,17 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ADR-004 / spec/13-multitenant.md §5: the URL's tenant_slug only
+	// selects which routing entry to look at — it is never itself proof of
+	// authorization. When auth is configured (authTenantID set by the auth
+	// middleware), it must match the resolved server's real tenant, or a
+	// valid caller for tenant A could reach tenant B's servers just by
+	// putting B's slug in the path.
+	if authTenantID := TenantIDFromContext(r.Context()); authTenantID != "" && authTenantID != srv.TenantID.String() {
+		writeError(w, r, http.StatusForbidden, "tenant does not own this server")
+		return
+	}
+
 	// Read the body now (rather than streaming it straight into the
 	// upstream request) so we can parse it once for the audit event and the
 	// tools/call detection SSEProxy needs — MCP request bodies are small
@@ -326,7 +337,44 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, srv *tenant.Server, body [
 		req.Header.Set("X-Forwarded-For", clientIP(r))
 	}
 
+	if err := applyUpstreamAuth(req, srv); err != nil {
+		return nil, err
+	}
+
 	return req, nil
+}
+
+// applyUpstreamAuth injects the credentials Conduit holds for srv into the
+// outbound upstream request, per spec/13-multitenant.md §6. This is
+// upstream authentication — Conduit proving itself to the MCP server it
+// manages — entirely separate from the auth middleware, which authenticates
+// the calling agent to Conduit. CRITICAL: never log srv.AuthConfig or any
+// value derived from it, only srv.AuthType.
+func applyUpstreamAuth(req *http.Request, srv *tenant.Server) error {
+	switch srv.AuthType {
+	case "", "none":
+		return nil
+	case "bearer":
+		token, ok := srv.AuthConfig["token"].(string)
+		if !ok {
+			return fmt.Errorf("server %q: auth_type bearer requires a string \"token\"", srv.Name)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	case "basic":
+		username, _ := srv.AuthConfig["username"].(string)
+		password, _ := srv.AuthConfig["password"].(string)
+		req.SetBasicAuth(username, password)
+	case "api_key":
+		header, ok := srv.AuthConfig["key_header"].(string)
+		if !ok {
+			return fmt.Errorf("server %q: auth_type api_key requires a string \"key_header\"", srv.Name)
+		}
+		value, _ := srv.AuthConfig["key_value"].(string)
+		req.Header.Set(header, value)
+	default:
+		return fmt.Errorf("server %q: unknown auth_type %q", srv.Name, srv.AuthType)
+	}
+	return nil
 }
 
 // forwardJSON handles the non-SSE response path: read the full body, run

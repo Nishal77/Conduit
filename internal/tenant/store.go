@@ -58,6 +58,15 @@ func (s *Store) Stop() {
 	s.wg.Wait()
 }
 
+// Invalidate forces an immediate reload of the routing table from
+// PostgreSQL, rather than waiting for the next refreshInterval tick. The
+// management API calls this after creating, updating, or deleting a tenant
+// or server so the change is routable right away (spec/13-multitenant.md
+// §7) instead of up to 5 seconds later.
+func (s *Store) Invalidate(ctx context.Context) error {
+	return s.reload(ctx)
+}
+
 func (s *Store) refreshLoop() {
 	defer s.wg.Done()
 
@@ -92,9 +101,13 @@ func (s *Store) reload(ctx context.Context) error {
 	tenantSlugs := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
 		servers = append(servers, &Server{
+			TenantID:    row.TenantID,
 			TenantSlug:  row.TenantSlug,
 			Name:        row.Name,
 			UpstreamURL: row.UpstreamURL,
+			AuthType:    row.AuthType,
+			AuthConfig:  row.AuthConfig,
+			Weight:      row.Weight,
 			Enabled:     row.Enabled,
 		})
 		tenantSlugs[row.TenantSlug] = struct{}{}

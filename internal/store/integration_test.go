@@ -150,7 +150,7 @@ func TestAPIKeyStore_CreateGetByHashRevoke(t *testing.T) {
 func TestMCPServerStore_CreateListAllEnabled(t *testing.T) {
 	db := testDB(t)
 	tenants := store.NewTenantStore(db)
-	servers := store.NewMCPServerStore(db)
+	servers := store.NewMCPServerStore(db, nil)
 	ctx := context.Background()
 
 	tenant, err := tenants.Create(ctx, "server-integration", "Server Test", "free")

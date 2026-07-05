@@ -8,13 +8,16 @@ import (
 
 	"github.com/conduit-oss/conduit/internal/api/httpx"
 	"github.com/conduit-oss/conduit/internal/store"
+	"github.com/conduit-oss/conduit/internal/tenant"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
-// ServersHandler implements /api/v1/servers.
+// ServersHandler implements /api/v1/servers. routing is invalidated after
+// every mutation — see invalidateRouting in tenants.go.
 type ServersHandler struct {
 	servers *store.MCPServerStore
+	routing *tenant.Store
 	log     zerolog.Logger
 }
 
@@ -131,6 +134,7 @@ func (h *ServersHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	invalidateRouting(h.routing, r)
 	httpx.WriteJSON(w, http.StatusCreated, toServerJSON(created))
 }
 
@@ -202,6 +206,7 @@ func (h *ServersHandler) Update(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "failed to update server")
 		return
 	}
+	invalidateRouting(h.routing, r)
 	httpx.WriteJSON(w, http.StatusOK, toServerJSON(updated))
 }
 
@@ -218,6 +223,7 @@ func (h *ServersHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "failed to delete server")
 		return
 	}
+	invalidateRouting(h.routing, r)
 	w.WriteHeader(http.StatusNoContent)
 }
 

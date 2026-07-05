@@ -2,22 +2,30 @@ package store
 
 // Stores bundles every table's store into one struct so callers that need
 // several of them — chiefly internal/api's handlers — can take a single
-// dependency instead of five separate constructor parameters.
+// dependency instead of separate constructor parameters per table.
 type Stores struct {
-	Tenants    *TenantStore
-	APIKeys    *APIKeyStore
-	Servers    *MCPServerStore
-	RateLimits *RateLimitStore
-	Audit      *AuditStore
+	Tenants      *TenantStore
+	APIKeys      *APIKeyStore
+	Servers      *MCPServerStore
+	RateLimits   *RateLimitStore
+	Audit        *AuditStore
+	OAuthApps    *OAuthApplicationStore
+	OAuthCodes   *OAuthAuthCodeStore
+	OAuthRefresh *OAuthRefreshTokenStore
 }
 
-// NewStores builds a Stores bundle backed by db.
-func NewStores(db *DB) *Stores {
+// NewStores builds a Stores bundle backed by db. credentialEncryptionKey
+// (see DeriveCredentialKey) encrypts MCP server auth_config at rest; pass
+// nil to store it in plaintext (development only).
+func NewStores(db *DB, credentialEncryptionKey []byte) *Stores {
 	return &Stores{
-		Tenants:    NewTenantStore(db),
-		APIKeys:    NewAPIKeyStore(db),
-		Servers:    NewMCPServerStore(db),
-		RateLimits: NewRateLimitStore(db),
-		Audit:      NewAuditStore(db),
+		Tenants:      NewTenantStore(db),
+		APIKeys:      NewAPIKeyStore(db),
+		Servers:      NewMCPServerStore(db, credentialEncryptionKey),
+		RateLimits:   NewRateLimitStore(db),
+		Audit:        NewAuditStore(db),
+		OAuthApps:    NewOAuthApplicationStore(db),
+		OAuthCodes:   NewOAuthAuthCodeStore(db),
+		OAuthRefresh: NewOAuthRefreshTokenStore(db),
 	}
 }
