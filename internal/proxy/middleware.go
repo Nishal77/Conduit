@@ -9,6 +9,8 @@ import (
 
 	"github.com/conduit-oss/conduit/internal/mcp"
 	"github.com/conduit-oss/conduit/internal/plugin"
+	"github.com/conduit-oss/conduit/internal/policy"
+	"github.com/conduit-oss/conduit/internal/webhook"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -26,6 +28,8 @@ const (
 	ctxKeySessionID
 	ctxKeyAuthMethod
 	ctxKeyStartTime
+	ctxKeyPolicyAction
+	ctxKeyPolicyRule
 )
 
 // TenantIDFromContext returns the authenticated tenant identifier set by
@@ -51,10 +55,16 @@ func WithAuthMethod(ctx context.Context, method string) context.Context {
 }
 
 // ServerNameFromContext returns the MCP server name segment of the request
-// path, set by the proxy handler once routing succeeds.
+// path, set by RequestContextMiddleware for every /mcp/ request.
 func ServerNameFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyServerName).(string)
 	return v
+}
+
+// WithServerName returns a copy of ctx carrying the MCP server name parsed
+// from the request path.
+func WithServerName(ctx context.Context, serverName string) context.Context {
+	return context.WithValue(ctx, ctxKeyServerName, serverName)
 }
 
 // RequestIDFromContext returns the X-Request-ID for this request.
@@ -84,6 +94,27 @@ func startTimeFromContext(ctx context.Context) time.Time {
 	return v
 }
 
+// PolicyActionFromContext returns the policy decision PolicyMiddleware
+// recorded for this request ("allow", "deny", "rate_limit", or "log"), or
+// "" if no policy engine is configured. writeAudit falls back to "allow"
+// when this is unset, matching pre-Phase-6 behavior.
+func PolicyActionFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyPolicyAction).(string)
+	return v
+}
+
+// PolicyRuleFromContext returns the name of the rule PolicyMiddleware
+// matched, or "__default__" if no rule matched.
+func PolicyRuleFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyPolicyRule).(string)
+	return v
+}
+
+func withPolicyDecision(ctx context.Context, d policy.Decision) context.Context {
+	ctx = context.WithValue(ctx, ctxKeyPolicyAction, string(d.Action))
+	return context.WithValue(ctx, ctxKeyPolicyRule, d.RuleName)
+}
+
 // Middleware wraps an http.Handler with additional behavior.
 type Middleware func(http.Handler) http.Handler
 
@@ -102,8 +133,12 @@ func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
 // rateLimit are injected (see WithAuthMiddleware / WithRateLimitMiddleware
 // in proxy.go) so this package doesn't need to import internal/auth or
 // internal/ratelimit directly; New defaults both to a no-op pass-through
-// when the caller doesn't supply one. Policy stays a no-op until Phase 6.
-func standardChain(auth, rateLimit Middleware, plugins *plugin.Registry) []Middleware {
+// when the caller doesn't supply one. internal/policy has no such heavy
+// dependency, so policyEngine is imported and used directly rather than
+// injected as an Option — an Engine with zero loaded rules (the default)
+// evaluates every request to allow, so a deployment with no policy file
+// configured behaves exactly as it did before Phase 6.
+func standardChain(auth, rateLimit Middleware, policyEngine *policy.Engine, dispatcher *webhook.Dispatcher, plugins *plugin.Registry) []Middleware {
 	return []Middleware{
 		RequestIDMiddleware,
 		TracingMiddleware, // opens conduit.request; everything below runs inside it
@@ -111,9 +146,34 @@ func standardChain(auth, rateLimit Middleware, plugins *plugin.Registry) []Middl
 		RecoveryMiddleware,
 		auth,
 		rateLimit,
-		PolicyMiddleware,
+		RequestContextMiddleware,
+		PolicyMiddleware(policyEngine, dispatcher),
 		PluginBeforeMiddleware(plugins),
 	}
+}
+
+// RequestContextMiddleware resolves the MCP server name from the URL path
+// and attaches it, along with a plugin.RequestContext snapshot and a fresh
+// plugin.CostAccumulator, to the request context — every stage downstream
+// that needs them (policy evaluation, plugin Before/After hooks, the audit
+// write) reads from context rather than each threading its own parameters
+// through forward()'s call chain. Runs after auth (needs tenant_id) and
+// before policy/plugin hooks (which need everything else here).
+func RequestContextMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, serverName, _ := MCPPathSegments(r.URL.Path)
+		ctx := WithServerName(r.Context(), serverName)
+
+		ctx = plugin.WithRequestContext(ctx, plugin.RequestContext{
+			TenantID:   TenantIDFromContext(ctx),
+			AgentID:    AgentIDFromContext(ctx),
+			ServerName: serverName,
+			RequestID:  RequestIDFromContext(ctx),
+		})
+		ctx = plugin.WithCostAccumulator(ctx, &plugin.CostAccumulator{})
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // RequestIDMiddleware assigns each request a unique ID (reusing an
@@ -231,14 +291,82 @@ func RateLimitMiddleware(next http.Handler) http.Handler {
 	return next
 }
 
-// PolicyMiddleware evaluates YAML allow/deny policy rules against the
-// request.
-//
-// Phase 1: no policy engine exists yet, so this is a no-op pass-through.
-// Phase 6 replaces the body with a compiled decision-tree evaluation that
-// returns 403 when a rule denies the call.
-func PolicyMiddleware(next http.Handler) http.Handler {
-	return next
+// PolicyMiddleware evaluates YAML allow/deny policy rules (spec/15-policy.md)
+// against the request before it reaches the plugin chain or the upstream
+// call. A rate_limit or log decision is recorded (for the audit event) but
+// does not itself block the request — spec/15's rate_limit action is a
+// policy-authored per-rule limit layered on top of the tenant-wide Redis
+// token bucket, not yet enforced here (would need its own Redis-backed
+// counter keyed by rule name; deferred until a concrete need arises rather
+// than built speculatively). deny is the one action this middleware
+// enforces directly, returning 403.
+func PolicyMiddleware(engine *policy.Engine, dispatcher *webhook.Dispatcher) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if engine == nil || r.Method != http.MethodPost || r.Body == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			body, err := ReadAndReplaceBody(r)
+			if err != nil {
+				writeError(w, r, http.StatusBadRequest, "failed to read request body")
+				return
+			}
+			msg, err := mcp.ParseMessage(body)
+			if err != nil {
+				// Not a well-formed MCP message: nothing to evaluate a
+				// tool-name-based policy against, so pass through — this
+				// mirrors PluginBeforeMiddleware's identical fallback.
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			toolName := mcp.ExtractToolName(msg)
+			serverName := ServerNameFromContext(r.Context())
+			tenantID := TenantIDFromContext(r.Context())
+
+			decision := engine.Evaluate(r.Context(), policy.EvalInput{
+				TenantID:   tenantID,
+				ToolName:   toolName,
+				ServerName: serverName,
+				AgentID:    AgentIDFromContext(r.Context()),
+			})
+			ctx := withPolicyDecision(r.Context(), decision)
+
+			if decision.Action == policy.ActionDeny {
+				message := decision.Message
+				if message == "" {
+					message = "request denied by policy"
+				}
+				dispatchPolicyViolation(dispatcher, tenantID, decision, toolName, serverName, RequestIDFromContext(r.Context()))
+				writeError(w, r.WithContext(ctx), http.StatusForbidden, message)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// dispatchPolicyViolation fires the policy.violation webhook event
+// (spec/16-webhooks.md §1) in the background — dispatcher.Dispatch does its
+// own I/O and must never block the request it was triggered by. A no-op if
+// dispatcher is nil (no webhooks configured) or tenantID doesn't parse as a
+// UUID (unauthenticated request — nothing to attribute the event to).
+func dispatchPolicyViolation(dispatcher *webhook.Dispatcher, tenantID string, decision policy.Decision, toolName, serverName, requestID string) {
+	if dispatcher == nil {
+		return
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return
+	}
+	go dispatcher.Dispatch(context.Background(), tid, "policy.violation", map[string]any{
+		"rule_name":   decision.RuleName,
+		"tool_name":   toolName,
+		"server_name": serverName,
+		"request_id":  requestID,
+	})
 }
 
 // PluginBeforeMiddleware runs registered plugins' Before hooks against the

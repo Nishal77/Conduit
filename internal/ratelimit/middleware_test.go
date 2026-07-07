@@ -19,7 +19,7 @@ func TestMiddleware_AllowsAndSetsHeaders(t *testing.T) {
 
 	called := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true; w.WriteHeader(http.StatusOK) })
-	handler := NewMiddleware(l)(next)
+	handler := NewMiddleware(l, nil)(next)
 
 	req := httptest.NewRequest(http.MethodPost, "/mcp/acme/github", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
 	rec := httptest.NewRecorder()
@@ -35,7 +35,7 @@ func TestMiddleware_DeniesOverLimit(t *testing.T) {
 	cfg := defaultTestConfig()
 	l := newTestLimiter(t, cfg)
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	handler := NewMiddleware(l)(next)
+	handler := NewMiddleware(l, nil)(next)
 
 	makeReq := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/mcp/acme/github", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
@@ -69,7 +69,7 @@ func TestMiddleware_ToolNameExtractedFromBodyWithoutConsumingIt(t *testing.T) {
 		bodyAtHandler, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
 	})
-	handler := NewMiddleware(l)(next)
+	handler := NewMiddleware(l, nil)(next)
 
 	reqBody := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"github/create_issue","arguments":{}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp/acme/github", strings.NewReader(reqBody))

@@ -5,13 +5,18 @@ import type {
   AuditQueryResult,
   CreateAPIKeyInput,
   CreateTenantInput,
+  CreateWebhookInput,
   ListResponse,
   MCPServer,
+  Plugin,
   RateLimitConfig,
   RegisterServerInput,
   ServerHealth,
   Tenant,
+  TenantPlugin,
   UpsertRateLimitInput,
+  UpsertTenantPluginInput,
+  Webhook,
 } from "@/types/api";
 
 export class APIError extends Error {
@@ -111,6 +116,34 @@ export class ConduitAPI {
   }
   deleteRateLimit(id: string): Promise<void> {
     return this.request("DELETE", `/api/v1/rate-limits/${id}`);
+  }
+
+  // Plugins
+  listPlugins(): Promise<ListResponse<Plugin>> {
+    return this.request("GET", "/api/v1/plugins");
+  }
+  listTenantPlugins(tenantID: string): Promise<ListResponse<TenantPlugin>> {
+    return this.request("GET", `/api/v1/tenants/${tenantID}/plugins`);
+  }
+  upsertTenantPlugin(tenantID: string, pluginID: string, input: UpsertTenantPluginInput): Promise<TenantPlugin> {
+    return this.request("PUT", `/api/v1/tenants/${tenantID}/plugins/${pluginID}`, input);
+  }
+  deleteTenantPlugin(tenantID: string, tenantPluginID: string): Promise<void> {
+    return this.request("DELETE", `/api/v1/tenants/${tenantID}/plugins/${tenantPluginID}`);
+  }
+
+  // Webhooks
+  listWebhooks(tenantID: string): Promise<ListResponse<Webhook>> {
+    return this.request("GET", `/api/v1/webhooks?tenant_id=${tenantID}`);
+  }
+  createWebhook(input: CreateWebhookInput): Promise<Webhook> {
+    return this.request("POST", "/api/v1/webhooks", input);
+  }
+  updateWebhook(id: string, input: Partial<Pick<Webhook, "name" | "url" | "events" | "enabled">>): Promise<Webhook> {
+    return this.request("PATCH", `/api/v1/webhooks/${id}`, input);
+  }
+  deleteWebhook(id: string): Promise<void> {
+    return this.request("DELETE", `/api/v1/webhooks/${id}`);
   }
 
   // Audit

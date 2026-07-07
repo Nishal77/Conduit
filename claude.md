@@ -1235,7 +1235,7 @@ docs(cli): add --json flag documentation for all commands
   place from Phase 1 (`internal/plugin`), so this phase is mostly the registry lifecycle,
   the HTTP callback plugin, the five built-in plugins, and the YAML policy engine with
   hot-reload
-- Read `spec/06-plugins.md`, `spec/07-policy.md` first
+- Read `spec/14-plugins.md`, `spec/15-policy.md` first
 
 ---
 

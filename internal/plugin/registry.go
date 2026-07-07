@@ -52,6 +52,29 @@ func (r *Registry) Register(reg Registration) {
 	})
 }
 
+// ReplaceAll atomically swaps the entire set of registrations, sorted by
+// priority. Used by cmd/conduit's DB-backed plugin loader to apply a fresh
+// tenant_plugins snapshot on every refresh tick without leaking
+// registrations for plugins that were disabled or removed since the last
+// load — the same full-swap approach internal/tenant.Router.ReplaceAll
+// uses for the routing table, and for the same reason: simpler to reason
+// about than diffing, and cheap enough at Conduit's expected scale.
+func (r *Registry) ReplaceAll(regs []Registration) {
+	sorted := make([]Registration, len(regs))
+	copy(sorted, regs)
+	for i := range sorted {
+		if sorted[i].Priority == 0 {
+			sorted[i].Priority = defaultPriority
+		}
+	}
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Priority < sorted[j].Priority
+	})
+	r.mu.Lock()
+	r.registrations = sorted
+	r.mu.Unlock()
+}
+
 // ForTenant returns every registration applicable to tenantID: plugins
 // registered globally (empty TenantID) plus plugins registered specifically
 // for tenantID, in priority order.

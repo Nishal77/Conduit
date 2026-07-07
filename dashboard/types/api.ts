@@ -134,3 +134,59 @@ export interface ListResponse<T> {
   offset: number;
   has_more: boolean;
 }
+
+export interface Plugin {
+  id: string;
+  name: string;
+  version: string;
+  plugin_type: "builtin" | "http_callback";
+  description?: string;
+  config_schema: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface TenantPlugin {
+  id: string;
+  tenant_id: string;
+  plugin_id: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpsertTenantPluginInput {
+  enabled: boolean;
+  config: Record<string, unknown>;
+  priority: number;
+}
+
+export type WebhookEvent =
+  | "ratelimit.exceeded"
+  | "policy.violation"
+  | "tool.call.success"
+  | "tool.call.error"
+  | "apikey.revoked"
+  | "server.health.down"
+  | "server.health.up"
+  | "audit.budget.exceeded";
+
+export interface Webhook {
+  id: string;
+  tenant_id: string;
+  name: string;
+  url: string;
+  events: WebhookEvent[];
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateWebhookInput {
+  tenant_id: string;
+  name: string;
+  url: string;
+  secret: string;
+  events: WebhookEvent[];
+}

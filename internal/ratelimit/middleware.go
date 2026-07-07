@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/conduit-oss/conduit/internal/mcp"
 	"github.com/conduit-oss/conduit/internal/proxy"
+	"github.com/conduit-oss/conduit/internal/webhook"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
@@ -23,11 +26,13 @@ type errorResponse struct {
 // NewMiddleware returns the real rate-limit middleware: it derives
 // (tenant_id, server_name, tool_name, agent_id) for the current request and
 // checks them against limiter. On denial it returns 429 with Retry-After
-// and X-RateLimit-* headers; on approval it still sets the informational
-// X-RateLimit-* headers before calling next.
+// and X-RateLimit-* headers and fires the ratelimit.exceeded webhook event
+// (spec/16-webhooks.md §1); on approval it still sets the informational
+// X-RateLimit-* headers before calling next. dispatcher may be nil (no
+// webhooks configured), in which case the deny path just skips dispatch.
 //
 // Wire this into the proxy with proxy.WithRateLimitMiddleware(ratelimit.NewMiddleware(...)).
-func NewMiddleware(limiter *Limiter) func(http.Handler) http.Handler {
+func NewMiddleware(limiter *Limiter, dispatcher *webhook.Dispatcher) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tenantID := proxy.TenantIDFromContext(r.Context())
@@ -45,6 +50,7 @@ func NewMiddleware(limiter *Limiter) func(http.Handler) http.Handler {
 			setRateLimitHeaders(w, result)
 			if !result.Allowed {
 				proxy.RateLimitDecisionsTotal.WithLabelValues(tenantID, result.Scope, "deny").Inc()
+				dispatchRateLimitExceeded(dispatcher, r, tenantID, serverName, toolName, agentID, result)
 				writeRateLimited(w, r, result)
 				return
 			}
@@ -52,6 +58,33 @@ func NewMiddleware(limiter *Limiter) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// dispatchRateLimitExceeded fires the ratelimit.exceeded webhook event in
+// the background — Dispatch does its own I/O and must never block the
+// request that triggered it. A no-op if dispatcher is nil or tenantID
+// doesn't parse as a UUID (unauthenticated request).
+func dispatchRateLimitExceeded(dispatcher *webhook.Dispatcher, r *http.Request, tenantID, serverName, toolName, agentID string, result *Result) {
+	if dispatcher == nil {
+		return
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return
+	}
+	retryAfter := int(time.Until(result.ResetAt).Seconds())
+	if retryAfter < 0 {
+		retryAfter = 0
+	}
+	go dispatcher.Dispatch(context.Background(), tid, "ratelimit.exceeded", map[string]any{
+		"tool_name":   toolName,
+		"server_name": serverName,
+		"agent_id":    agentID,
+		"request_id":  proxy.RequestIDFromContext(r.Context()),
+		"scope":       result.Scope,
+		"limit":       result.Limit,
+		"retry_after": retryAfter,
+	})
 }
 
 // extractToolName peeks the request body for a tools/call method's tool

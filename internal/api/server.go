@@ -113,9 +113,22 @@ func buildRouter(cfg *config.Config, h *handlers.Handlers, keyValidator *auth.AP
 				r.Post("/{id}/rotate-secret", h.OAuthApps.RotateSecret)
 			})
 
-			// /webhooks and /plugins are not wired up yet — see the
-			// package doc comment on internal/api/handlers for why (their
-			// tables land in Phase 6).
+			r.Route("/plugins", func(r chi.Router) {
+				r.Get("/", h.Plugins.List)
+			})
+
+			r.Route("/tenants/{tenantID}/plugins", func(r chi.Router) {
+				r.Get("/", h.Plugins.ListForTenant)
+				r.Put("/{pluginID}", h.Plugins.Upsert)
+				r.Delete("/{id}", h.Plugins.Delete)
+			})
+
+			r.Route("/webhooks", func(r chi.Router) {
+				r.Get("/", h.Webhooks.List)
+				r.Post("/", h.Webhooks.Create)
+				r.Patch("/{id}", h.Webhooks.Update)
+				r.Delete("/{id}", h.Webhooks.Delete)
+			})
 		})
 	})
 

@@ -16,11 +16,13 @@ import (
 	"github.com/conduit-oss/conduit/internal/auth"
 	"github.com/conduit-oss/conduit/internal/config"
 	"github.com/conduit-oss/conduit/internal/plugin"
+	"github.com/conduit-oss/conduit/internal/policy"
 	"github.com/conduit-oss/conduit/internal/proxy"
 	"github.com/conduit-oss/conduit/internal/ratelimit"
 	"github.com/conduit-oss/conduit/internal/store"
 	"github.com/conduit-oss/conduit/internal/tenant"
 	"github.com/conduit-oss/conduit/internal/tracing"
+	"github.com/conduit-oss/conduit/internal/webhook"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
@@ -98,7 +100,7 @@ func runProxy(cmd *cobra.Command, flags *proxyStartFlags) error {
 	router := tenant.NewRouter()
 	plugins := plugin.NewRegistry()
 
-	proxyOpts, auditSink, mgmtHandler, cleanupDeps := wireDataLayer(ctx, cfg, router, logger)
+	proxyOpts, auditSink, mgmtHandler, cleanupDeps := wireDataLayer(ctx, cfg, router, plugins, logger)
 	defer cleanupDeps()
 
 	auditor := audit.New(auditSink, &cfg.Audit, logger)
@@ -202,16 +204,19 @@ func runProxy(cmd *cobra.Command, flags *proxyStartFlags) error {
 }
 
 // wireDataLayer attempts to connect PostgreSQL and Redis. On success it
-// returns the proxy.Options that enable real auth, rate limiting, and
-// database-backed routing (plus their /readyz checkers), a PostgreSQL-backed
-// audit Sink, and the management API handler; on any connection failure it
-// logs a warning and returns an empty option set, a LogSink fallback, and a
-// nil management API handler (meaning runProxy skips starting that
-// listener entirely — there's nothing in a nonexistent database to
-// manage). The returned cleanup func closes whatever was successfully
-// opened and must always be called (via defer), even on the fallback path
-// where it's a no-op.
-func wireDataLayer(ctx context.Context, cfg *config.Config, router *tenant.Router, logger zerolog.Logger) (opts []proxy.Option, sink audit.Sink, mgmtHandler http.Handler, cleanup func()) {
+// returns the proxy.Options that enable real auth, rate limiting,
+// database-backed routing, policy evaluation, the plugin system, and
+// webhook delivery (plus their /readyz checkers), a PostgreSQL-backed audit
+// Sink, and the management API handler; on any connection failure it logs
+// a warning and returns an empty option set, a LogSink fallback, and a nil
+// management API handler (meaning runProxy skips starting that listener
+// entirely — there's nothing in a nonexistent database to manage). The
+// returned cleanup func closes whatever was successfully opened and must
+// always be called (via defer), even on the fallback path where it's a
+// no-op. plugins is populated in place by the DB-backed plugin loader
+// started here; the caller (runProxy) owns calling plugins.Shutdown once,
+// after cleanup has stopped that loader's background refresh.
+func wireDataLayer(ctx context.Context, cfg *config.Config, router *tenant.Router, plugins *plugin.Registry, logger zerolog.Logger) (opts []proxy.Option, sink audit.Sink, mgmtHandler http.Handler, cleanup func()) {
 	cleanup = func() {}
 	sink = audit.NewLogSink(logger)
 
@@ -235,6 +240,24 @@ func wireDataLayer(ctx context.Context, cfg *config.Config, router *tenant.Route
 		logger.Warn().Err(err).Msg("initial routing table load failed, continuing with an empty table")
 	}
 
+	pluginLoader := newPluginLoader(plugins, stores.Plugins, cfg.Plugins.HTTPTimeout, logger)
+	if err := pluginLoader.Start(ctx); err != nil {
+		logger.Warn().Err(err).Msg("initial plugin registry load failed, continuing with an empty registry")
+	}
+
+	dispatcher := webhook.NewDispatcher(stores.Webhooks, &cfg.Webhooks, logger)
+	dispatcher.Retrier().Start(ctx)
+
+	policyEngine := policy.New(logger)
+	var policyLoader *policy.Loader
+	if cfg.Policy.File != "" {
+		policyLoader = policy.NewLoader(cfg.Policy.File, policyEngine, cfg.Policy.ReloadInterval, logger)
+		if err := policyLoader.Start(ctx); err != nil {
+			logger.Warn().Err(err).Str("file", cfg.Policy.File).Msg("failed to load policy file, running with no rules (default allow)")
+			policyLoader = nil
+		}
+	}
+
 	// oauthIssuer identifies Conduit as a token issuer/authorization server
 	// (the JWT "iss" claim, and the base used to build RFC 8414 metadata
 	// endpoint URLs). It's a stable identifier, not necessarily Conduit's
@@ -247,9 +270,14 @@ func wireDataLayer(ctx context.Context, cfg *config.Config, router *tenant.Route
 	limiter := ratelimit.New(redisClient, stores.RateLimits, &cfg.RateLimit, logger)
 	oauthServer := auth.NewOAuthServer(stores.OAuthApps, stores.OAuthCodes, stores.OAuthRefresh, jwtValidator, redisClient, cfg.Auth.AccessTokenTTL, cfg.Auth.RefreshTokenTTL)
 
-	logger.Info().Msg("database and redis connected, auth, rate limiting, audit persistence, and management api enabled")
+	logger.Info().Msg("database and redis connected, auth, rate limiting, audit persistence, policy, plugins, webhooks, and management api enabled")
 
 	cleanup = func() {
+		if policyLoader != nil {
+			policyLoader.Stop()
+		}
+		dispatcher.Retrier().Stop()
+		pluginLoader.Stop()
 		routingStore.Stop()
 		_ = redisClient.Close()
 		db.Close()
@@ -257,9 +285,11 @@ func wireDataLayer(ctx context.Context, cfg *config.Config, router *tenant.Route
 
 	opts = []proxy.Option{
 		proxy.WithAuthMiddleware(auth.NewMiddleware(keyValidator, jwtValidator)),
-		proxy.WithRateLimitMiddleware(ratelimit.NewMiddleware(limiter)),
+		proxy.WithRateLimitMiddleware(ratelimit.NewMiddleware(limiter, dispatcher)),
 		proxy.WithReadyChecker(dbReadyChecker{db}),
 		proxy.WithReadyChecker(redisReadyChecker{redisClient}),
+		proxy.WithPolicyEngine(policyEngine),
+		proxy.WithWebhookDispatcher(dispatcher),
 	}
 	mgmtHandler = api.New(cfg, stores, oauthServer, keyValidator, oauthIssuer, routingStore, logger)
 	return opts, audit.NewPostgresSink(stores.Audit), mgmtHandler, cleanup

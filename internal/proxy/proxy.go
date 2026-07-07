@@ -17,7 +17,10 @@ import (
 	"github.com/conduit-oss/conduit/internal/config"
 	"github.com/conduit-oss/conduit/internal/mcp"
 	"github.com/conduit-oss/conduit/internal/plugin"
+	"github.com/conduit-oss/conduit/internal/policy"
 	"github.com/conduit-oss/conduit/internal/tenant"
+	"github.com/conduit-oss/conduit/internal/webhook"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
@@ -70,17 +73,19 @@ func (c routingChecker) Check(context.Context) error {
 
 // Proxy is the core MCP reverse proxy.
 type Proxy struct {
-	cfg       *config.Config
-	router    *tenant.Router
-	plugins   *plugin.Registry
-	auditor   *audit.Writer
-	transport http.RoundTripper
-	sse       *SSEProxy
-	checkers  []ReadyChecker
-	log       zerolog.Logger
+	cfg        *config.Config
+	router     *tenant.Router
+	plugins    *plugin.Registry
+	auditor    *audit.Writer
+	dispatcher *webhook.Dispatcher
+	transport  http.RoundTripper
+	sse        *SSEProxy
+	checkers   []ReadyChecker
+	log        zerolog.Logger
 
 	authMiddleware      Middleware
 	rateLimitMiddleware Middleware
+	policyEngine        *policy.Engine
 
 	mcpHandler http.Handler
 }
@@ -112,6 +117,21 @@ func WithReadyChecker(c ReadyChecker) Option {
 	return func(p *Proxy) { p.checkers = append(p.checkers, c) }
 }
 
+// WithPolicyEngine enables policy evaluation (spec/15-policy.md) on every
+// /mcp/ request. Without this option policyEngine stays nil and
+// PolicyMiddleware is a pass-through, identical to pre-Phase-6 behavior.
+func WithPolicyEngine(e *policy.Engine) Option {
+	return func(p *Proxy) { p.policyEngine = e }
+}
+
+// WithWebhookDispatcher enables outbound webhook notifications
+// (spec/16-webhooks.md) for events the proxy fires directly:
+// tool.call.success, tool.call.error, and policy.violation. Without this
+// option dispatcher stays nil and those call sites skip dispatch entirely.
+func WithWebhookDispatcher(d *webhook.Dispatcher) Option {
+	return func(p *Proxy) { p.dispatcher = d }
+}
+
 // New creates a Proxy with all required dependencies injected and any
 // number of Options applied on top. With no options, auth and rate limiting
 // are no-op pass-throughs (Phase 1 behavior); see WithAuthMiddleware and
@@ -139,7 +159,7 @@ func New(
 	for _, opt := range opts {
 		opt(p)
 	}
-	p.mcpHandler = Chain(http.HandlerFunc(p.forward), standardChain(p.authMiddleware, p.rateLimitMiddleware, plugins)...)
+	p.mcpHandler = Chain(http.HandlerFunc(p.forward), standardChain(p.authMiddleware, p.rateLimitMiddleware, p.policyEngine, p.dispatcher, plugins)...)
 	return p
 }
 
@@ -287,18 +307,46 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 			p.log.Warn().Err(err).Msg("sse forward ended with error")
 		}
 	} else {
-		statusCode, responseMeta = p.forwardJSON(w, resp, callReq, tenantID)
+		statusCode, responseMeta = p.forwardJSON(r.Context(), w, resp, callReq, tenantID)
 	}
 
 	toolName := ""
 	if callReq != nil {
 		toolName = mcp.ExtractToolName(callReq)
 	}
-	SetRequestSpanAttributes(r.Context(), tenantID, serverName, toolName, AuthMethodFromContext(r.Context()), "allow", statusCode)
-	RecordToolCall(tenantID, serverName, toolName, statusCode, "allow")
+	policyAction := PolicyActionFromContext(r.Context())
+	if policyAction == "" {
+		policyAction = "allow"
+	}
+	SetRequestSpanAttributes(r.Context(), tenantID, serverName, toolName, AuthMethodFromContext(r.Context()), policyAction, statusCode)
+	RecordToolCall(tenantID, serverName, toolName, statusCode, policyAction)
 	RecordProxyLatency(tenantID, time.Since(start))
 
+	p.dispatchToolCallWebhook(r, tenantID, serverName, toolName, statusCode)
 	p.writeAudit(r, callReq, tenantSlug, serverName, tenantID, statusCode, responseMeta, start)
+}
+
+// dispatchToolCallWebhook fires tool.call.success or tool.call.error
+// (spec/16-webhooks.md §1) in the background. A no-op if no dispatcher is
+// configured or tenantID doesn't parse as a UUID.
+func (p *Proxy) dispatchToolCallWebhook(r *http.Request, tenantID, serverName, toolName string, statusCode int) {
+	if p.dispatcher == nil {
+		return
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return
+	}
+	eventType := "tool.call.success"
+	if statusCode >= 400 {
+		eventType = "tool.call.error"
+	}
+	go p.dispatcher.Dispatch(context.Background(), tid, eventType, map[string]any{
+		"tool_name":   toolName,
+		"server_name": serverName,
+		"status_code": statusCode,
+		"request_id":  RequestIDFromContext(r.Context()),
+	})
 }
 
 // buildUpstreamRequest constructs the outbound request to srv.UpstreamURL,
@@ -378,13 +426,12 @@ func applyUpstreamAuth(req *http.Request, srv *tenant.Server) error {
 }
 
 // forwardJSON handles the non-SSE response path: read the full body, run
-// plugin.After, write it back to the agent. Used for methods like
-// tools/list whose upstream response is a single JSON object rather than a
-// stream.
-// forwardJSON handles the non-SSE response path: read the full body, run
 // plugin.After, write it back to the agent, and return both the status
-// code and a response_meta summary for the audit event.
-func (p *Proxy) forwardJSON(w http.ResponseWriter, resp *http.Response, callReq *mcp.Message, tenantID string) (int, map[string]any) {
+// code and a response_meta summary for the audit event. ctx is the
+// request's own context (not context.Background()) so After hooks can read
+// the plugin.RequestContext / plugin.CostAccumulator RequestContextMiddleware
+// attached to it, the same as the SSE path already does.
+func (p *Proxy) forwardJSON(ctx context.Context, w http.ResponseWriter, resp *http.Response, callReq *mcp.Message, tenantID string) (int, map[string]any) {
 	body, err := readBodyLimited(resp.Body)
 	if err != nil {
 		p.log.Warn().Err(err).Msg("failed to read upstream response body")
@@ -394,7 +441,7 @@ func (p *Proxy) forwardJSON(w http.ResponseWriter, resp *http.Response, callReq 
 
 	respMsg, parseErr := mcp.ParseMessage(body)
 	if parseErr == nil && callReq != nil {
-		if modified := p.plugins.RunAfter(context.Background(), tenantID, callReq, respMsg); modified != nil {
+		if modified := p.plugins.RunAfter(ctx, tenantID, callReq, respMsg); modified != nil {
 			respMsg = modified
 			if out, err := json.Marshal(modified); err == nil {
 				body = out
@@ -469,6 +516,15 @@ func (p *Proxy) writeAudit(r *http.Request, callReq *mcp.Message, tenantSlug, se
 	_, auditSpan := StartAuditWriteSpan(r.Context())
 	defer auditSpan.End()
 
+	policyAction := PolicyActionFromContext(r.Context())
+	if policyAction == "" {
+		policyAction = "allow" // no policy engine configured
+	}
+	var costUSD float64
+	if acc := plugin.CostAccumulatorFromContext(r.Context()); acc != nil {
+		costUSD = acc.Total()
+	}
+
 	p.auditor.Write(audit.Event{
 		TenantID:     tenantID,
 		AgentID:      AgentIDFromContext(r.Context()),
@@ -480,7 +536,8 @@ func (p *Proxy) writeAudit(r *http.Request, callReq *mcp.Message, tenantSlug, se
 		StatusCode:   statusCode,
 		LatencyMs:    int(time.Since(start).Milliseconds()),
 		AuthMethod:   AuthMethodFromContext(r.Context()),
-		PolicyAction: "allow", // Phase 6 policy engine sets deny/rate_limited
+		PolicyAction: policyAction,
+		CostUSD:      costUSD,
 		TraceID:      TraceIDFromContext(r.Context()),
 	})
 }

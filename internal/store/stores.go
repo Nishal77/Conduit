@@ -12,6 +12,8 @@ type Stores struct {
 	OAuthApps    *OAuthApplicationStore
 	OAuthCodes   *OAuthAuthCodeStore
 	OAuthRefresh *OAuthRefreshTokenStore
+	Plugins      *PluginStore
+	Webhooks     *WebhookStore
 }
 
 // NewStores builds a Stores bundle backed by db. credentialEncryptionKey
@@ -27,5 +29,7 @@ func NewStores(db *DB, credentialEncryptionKey []byte) *Stores {
 		OAuthApps:    NewOAuthApplicationStore(db),
 		OAuthCodes:   NewOAuthAuthCodeStore(db),
 		OAuthRefresh: NewOAuthRefreshTokenStore(db),
+		Plugins:      NewPluginStore(db),
+		Webhooks:     NewWebhookStore(db),
 	}
 }
